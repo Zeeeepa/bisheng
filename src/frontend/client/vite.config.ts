@@ -20,7 +20,7 @@ export default defineConfig({
       //   changeOrigin: true,
       // },
       '/workspace/bisheng': {
-        target: "http://192.168.106.116:9000",
+        target: "http://192.168.106.120:9102",
         changeOrigin: true,
         secure: false,
         rewrite: (path) => {
@@ -28,9 +28,11 @@ export default defineConfig({
         },
       },
       '/workspace/api': {
-        target: 'http://192.168.106.120:3002',
+        // target: 'http://192.168.2.38:7860',
+        target: 'http://192.168.106.120:3003',
         changeOrigin: true,
         secure: false,
+        ws: true,
         rewrite: (path) => {
           return path.replace(/^\/workspace\/api/, '/api');
         },

@@ -1,0 +1,729 @@
+import asyncio
+import json
+import logging
+import os
+import shutil
+from contextlib import asynccontextmanager
+from datetime import datetime
+from typing import Optional, List, Dict, Callable
+
+from bisheng.api.services.linsight.sop_manage import SOPManageService
+from bisheng.api.services.linsight.workbench_impl import LinsightWorkbenchImpl
+from bisheng.api.services.llm import LLMService
+from bisheng.api.services.tool import ToolServices
+from bisheng.api.v1.schema.inspiration_schema import SOPManagementSchema, SOPManagementUpdateSchema
+from bisheng.cache.utils import create_cache_folder_async, CACHE_DIR
+from bisheng.core.app_context import app_ctx
+from bisheng.database.models import LinsightExecuteTask
+from bisheng.database.models.linsight_execute_task import LinsightExecuteTaskDao, ExecuteTaskStatusEnum, \
+    ExecuteTaskTypeEnum
+from bisheng.database.models.linsight_session_version import LinsightSessionVersionDao, SessionVersionStatusEnum, \
+    LinsightSessionVersion
+from bisheng.database.models.linsight_sop import LinsightSOPDao
+from bisheng.interface.llms.custom import BishengLLM
+from bisheng.settings import settings
+from bisheng.utils import util
+from bisheng.utils.minio_client import minio_client
+from bisheng.linsight.state_message_manager import LinsightStateMessageManager, MessageData, MessageEventType
+from bisheng.utils.util import sync_func_to_async
+from bisheng_langchain.linsight.agent import LinsightAgent
+from bisheng_langchain.linsight.const import TaskStatus
+from bisheng_langchain.linsight.event import NeedUserInput, GenerateSubTask, ExecStep, TaskStart, TaskEnd, BaseEvent
+
+logger = logging.getLogger(__name__)
+
+
+class TaskExecutionError(Exception):
+    """任务执行异常"""
+    pass
+
+
+class UserTerminationError(Exception):
+    """用户主动终止异常"""
+    pass
+
+
+class LinsightWorkflowTask:
+    """工作流任务执行器 - 负责管理整个任务的生命周期"""
+
+    USER_TERMINATION_CHECK_INTERVAL = 2
+
+    def __init__(self, semaphore: asyncio.Semaphore):
+        self.semaphore = semaphore
+        self._state_manager: Optional[LinsightStateMessageManager] = None
+        self._is_terminated = False
+        self._termination_task: Optional[asyncio.Task] = None
+        self._final_result: Optional[TaskEnd] = None
+
+    # ==================== 资源管理 ====================
+
+    @asynccontextmanager
+    async def _managed_execution(self, session_version_id: str):
+        """管理执行资源的上下文管理器"""
+        file_dir = None
+        try:
+            self._state_manager = LinsightStateMessageManager(session_version_id)
+            session_model = await self._get_session_model(session_version_id)
+
+            # 启动终止监控
+            await self._start_termination_monitor(session_model)
+
+            # 初始化文件目录
+            file_dir = await self._init_file_directory(session_model)
+
+            yield session_model, file_dir
+
+        finally:
+            await self._cleanup_resources(file_dir)
+
+    async def _cleanup_resources(self, file_dir: Optional[str] = None):
+        """清理资源"""
+        try:
+            # 停止终止监控
+            await self._stop_termination_monitor()
+
+            # 清理文件目录
+            if file_dir and os.path.exists(file_dir):
+                shutil.rmtree(file_dir, ignore_errors=True)
+
+        except Exception as e:
+            logger.error(f"资源清理失败: {e}")
+        finally:
+            # 释放信号量
+            if self.semaphore.locked():
+                self.semaphore.release()
+
+    # ==================== 核心执行逻辑 ====================
+
+    async def async_run(self, session_version_id: str) -> None:
+        """异步任务执行入口"""
+
+        logger.info(f"开始执行任务: session_version_id={session_version_id}")
+
+        try:
+            async with self._managed_execution(session_version_id) as (session_model, file_dir):
+                await self._execute_workflow(session_model, file_dir)
+
+        except UserTerminationError:
+            logger.info(f"任务被用户主动终止: session_version_id={session_version_id}")
+        except Exception as e:
+            logger.error(f"任务执行失败: session_version_id={session_version_id}, error={e}")
+            await self._handle_execution_error(session_version_id, e)
+
+    async def _execute_workflow(self, session_model: LinsightSessionVersion, file_dir: str):
+        """执行工作流的核心逻辑"""
+        # 检查会话状态
+        if await self._is_session_in_progress(session_model):
+            return
+
+        # 更新会话状态为进行中
+        await self._update_session_status(session_model, SessionVersionStatusEnum.IN_PROGRESS)
+
+        # 初始化执行组件
+        llm = await self._get_llm()
+        # 生成工具列表
+        tools = await self._generate_tools(session_model, llm)
+        linsight_tools = await ToolServices.init_linsight_tools(root_path=file_dir)
+        tools.extend(linsight_tools)
+        # 创建智能体
+        agent = await self._create_agent(session_model, llm, tools, file_dir)
+
+        # 检查是否在初始化过程中被终止
+        self._check_termination()
+
+        # 生成并保存任务
+        task_info = await agent.generate_task(session_model.sop)
+        await self._save_task_info(session_model, task_info)
+
+        # 执行任务
+        success = await self._execute_agent_tasks(agent, task_info, session_model)
+
+        if success:
+            await self._handle_task_completion(session_model, llm, file_dir)
+        else:
+            raise UserTerminationError("任务被用户终止")
+
+    # ==================== 会话和状态管理 ====================
+
+    async def _get_session_model(self, session_version_id: str) -> LinsightSessionVersion:
+        """获取会话模型"""
+        try:
+            return await LinsightSessionVersionDao.get_by_id(session_version_id)
+        except Exception as e:
+            raise TaskExecutionError(f"获取会话模型失败: {e}")
+
+    async def _is_session_in_progress(self, session_model: LinsightSessionVersion) -> bool:
+        """检查会话是否已在进行中"""
+        if session_model.status == SessionVersionStatusEnum.IN_PROGRESS:
+            logger.info(f"会话 {session_model.id} 已在进行中")
+            return True
+        return False
+
+    async def _update_session_status(self, session_model: LinsightSessionVersion, status: SessionVersionStatusEnum):
+        """更新会话状态"""
+        session_model.status = status
+        await self._state_manager.set_session_version_info(session_model)
+
+    # ==================== 组件初始化 ====================
+
+    async def _get_llm(self) -> BishengLLM:
+        """获取LLM实例"""
+        try:
+            workbench_conf = await LLMService.get_workbench_llm()
+            return BishengLLM(model_id=workbench_conf.task_model.id)
+        except Exception as e:
+            raise TaskExecutionError(f"LLM初始化失败: {e}")
+
+    @create_cache_folder_async
+    async def _init_file_directory(self, session_model: LinsightSessionVersion) -> str:
+        """初始化文件目录"""
+        file_dir = os.path.join(CACHE_DIR, "linsight", session_model.id)
+        os.makedirs(file_dir, exist_ok=True)
+
+        if not session_model.files:
+            return file_dir
+
+        # 并发下载文件
+        download_tasks = [
+            self._download_file(file_info, file_dir)
+            for file_info in session_model.files
+        ]
+
+        results = await asyncio.gather(*download_tasks, return_exceptions=True)
+
+        # 记录下载失败的文件
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                file_name = os.path.basename(session_model.files[i]["markdown_file_path"])
+                logger.error(f"文件下载失败 {file_name}: {result}")
+
+        return file_dir
+
+    async def _download_file(self, file_info: dict, target_dir: str) -> str:
+        """下载单个文件"""
+        object_name = file_info["markdown_file_path"]
+        file_name = os.path.basename(object_name)
+        file_path = os.path.join(target_dir, file_name)
+
+        try:
+            file_url = minio_client.get_share_link(object_name)
+            http_client = await app_ctx.get_http_client()
+
+            with open(file_path, "wb") as f:
+                async for chunk in http_client.stream(method="GET", url=str(file_url)):
+                    f.write(chunk)
+
+            if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
+                raise ValueError(f"文件下载失败或为空: {object_name}")
+
+            return file_path
+
+        except Exception as e:
+            logger.error(f"下载文件失败 {object_name}: {e}")
+            raise
+
+    async def _generate_tools(self, session_model: LinsightSessionVersion, llm: BishengLLM) -> List:
+        """生成工具列表"""
+        if not session_model.tools:
+            return []
+
+        return await LinsightWorkbenchImpl.init_linsight_config_tools(session_version=session_model, llm=llm)
+
+    async def _create_agent(self, session_model: LinsightSessionVersion, llm: BishengLLM, tools: List,
+                            file_dir: str) -> LinsightAgent:
+
+        workbench_conf = await LLMService.get_workbench_llm()
+
+        """创建智能体"""
+        return LinsightAgent(
+            llm=llm,
+            query=session_model.question,
+            tools=tools,
+            file_dir=file_dir,
+            task_mode=workbench_conf.linsight_executor_mode,
+            debug=settings.linsight_conf.debug,
+            debug_id=session_model.id
+        )
+
+    # ==================== 任务执行 ====================
+
+    async def _save_task_info(self, session_model: LinsightSessionVersion, task_info: List[dict]):
+        """保存任务信息"""
+        try:
+            tasks = []
+            for info in task_info:
+                previous_task_id = self._find_previous_task_id(info["id"], task_info)
+
+                task = LinsightExecuteTask(
+                    id=info["id"],
+                    parent_task_id=info.get("parent_id"),
+                    session_version_id=session_model.id,
+                    previous_task_id=previous_task_id,
+                    next_task_id=info.get("next_id", [None])[0],
+                    task_type=ExecuteTaskTypeEnum.COMPOSITE if info.get("node_loop") else ExecuteTaskTypeEnum.SINGLE,
+                    task_data=info
+                )
+                tasks.append(task)
+
+            await LinsightExecuteTaskDao.batch_create_tasks(tasks)
+            await self._state_manager.set_execution_tasks(tasks)
+
+            # 推送生成任务消息
+            await self._state_manager.push_message(MessageData(
+                event_type=MessageEventType.TASK_GENERATE,
+                data={"tasks": [task.model_dump() for task in tasks]}
+            ))
+
+            logger.info(f"Set {len(tasks)} execution tasks")
+
+        except Exception as e:
+            logger.error(f"保存任务信息失败: {e}")
+            raise TaskExecutionError(f"保存任务信息失败: {e}")
+
+    def _find_previous_task_id(self, target_task_id: str, task_info: List[dict]) -> Optional[str]:
+        """查找前置任务ID"""
+        for task in task_info:
+            if task["id"] == target_task_id:
+                continue
+            if target_task_id in task.get("next_id", []):
+                return task["id"]
+        return None
+
+    async def _execute_agent_tasks(self, agent, task_info: List[dict],
+                                   session_model) -> bool:
+        """执行智能体任务 - 修改版本支持用户终止"""
+
+        async def agent_execution():
+            """智能体执行任务"""
+            try:
+                async for event in agent.ainvoke(task_info, session_model.sop):
+                    await self._handle_event(agent, event, session_model)
+                return True
+            except Exception as e:
+                logger.error(f"智能体执行异常: {e}")
+                raise
+
+        async def termination_monitor():
+            """终止监控任务"""
+            while True:
+                await asyncio.sleep(0.5)  # 每0.5秒检查一次
+                self._check_termination()
+
+        try:
+            # 创建两个并发任务
+            agent_task = asyncio.create_task(agent_execution())
+            monitor_task = asyncio.create_task(termination_monitor())
+
+            # 等待任何一个任务完成
+            done, pending = await asyncio.wait(
+                [agent_task, monitor_task],
+                return_when=asyncio.FIRST_COMPLETED
+            )
+
+            # 取消未完成的任务
+            for task in pending:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    logger.debug("成功取消挂起的任务")
+                    pass
+
+            # 检查完成的任务结果
+            for task in done:
+                if task.exception():
+                    if isinstance(task.exception(), UserTerminationError):
+                        logger.info("智能体任务被用户终止")
+                        return False
+                    else:
+                        raise task.exception()
+                else:
+                    # 如果是智能体任务正常完成
+                    if task == agent_task:
+                        logger.info("智能体任务正常完成")
+                        return True
+
+            return True
+
+        except UserTerminationError:
+            logger.info("智能体任务被用户终止")
+            return False
+        except Exception as e:
+            logger.error(f"智能体任务执行失败: {e}")
+            raise TaskExecutionError(f"智能体任务执行失败: {e}")
+
+    # ==================== 事件处理 ====================
+
+    async def _handle_event(self, agent: LinsightAgent, event: BaseEvent, session_model: LinsightSessionVersion):
+        """处理事件"""
+
+        event_handlers: Dict[type[BaseEvent], Callable] = {
+            GenerateSubTask: self._handle_generate_subtask,
+            TaskStart: self._handle_task_start,
+            TaskEnd: self._handle_task_end,
+            NeedUserInput: self._handle_need_user_input,
+            ExecStep: self._handle_exec_step,
+        }
+
+        handler = event_handlers.get(type(event))
+        if handler:
+            await handler(agent, event, session_model)
+        else:
+            logger.warning(f"未知事件类型: {type(event)}")
+
+    async def _handle_generate_subtask(self, agent: LinsightAgent, event: GenerateSubTask,
+                                       session_model: LinsightSessionVersion):
+        """处理生成子任务事件"""
+        await self._save_task_info(session_model, event.subtask)
+        logger.debug(f"生成子任务: {event}")
+
+    async def _handle_task_start(self, agent: LinsightAgent, event: TaskStart, session_model: LinsightSessionVersion):
+        """处理任务开始事件"""
+        task_data = await self._state_manager.update_execution_task_status(
+            task_id=event.task_id,
+            status=ExecuteTaskStatusEnum.IN_PROGRESS
+        )
+
+        await self._state_manager.push_message(
+            MessageData(event_type=MessageEventType.TASK_START, data=task_data)
+        )
+
+    async def _handle_task_end(self, agent: LinsightAgent, event: TaskEnd, session_model: LinsightSessionVersion):
+        """处理任务结束事件"""
+        status = ExecuteTaskStatusEnum.SUCCESS if event.status == TaskStatus.SUCCESS.value else ExecuteTaskStatusEnum.FAILED
+
+        task_data = await self._state_manager.update_execution_task_status(
+            task_id=event.task_id,
+            status=status,
+            result={"answer": event.answer},
+            task_data=event.data
+        )
+
+        await self._state_manager.push_message(
+            MessageData(event_type=MessageEventType.TASK_END, data=task_data)
+        )
+
+        # 保存最终结果
+        self._final_result = event
+
+    async def _handle_need_user_input(self, agent: LinsightAgent, event: NeedUserInput,
+                                      session_model: LinsightSessionVersion):
+        """处理需要用户输入事件"""
+        asyncio.create_task(self._wait_for_user_input(agent, event))
+
+    async def _handle_exec_step(self, agent: LinsightAgent, event: ExecStep, session_model: LinsightSessionVersion):
+        """处理执行步骤事件"""
+        await self._state_manager.add_execution_task_step(event.task_id, step=event)
+        await self._state_manager.push_message(
+            MessageData(event_type=MessageEventType.TASK_EXECUTE_STEP, data=event.model_dump())
+        )
+
+    # ==================== 用户输入处理 ====================
+
+    async def _wait_for_user_input(self, agent: LinsightAgent, event: NeedUserInput):
+        """等待用户输入"""
+        try:
+            # 更新状态为等待用户输入
+            await self._state_manager.update_execution_task_status(
+                event.task_id,
+                status=ExecuteTaskStatusEnum.WAITING_FOR_USER_INPUT,
+                input_prompt=event.call_reason
+            )
+
+            # 推送用户输入事件
+            await self._state_manager.push_message(
+                MessageData(event_type=MessageEventType.USER_INPUT, data=event.model_dump())
+            )
+
+            # 等待用户输入完成
+            task_model = await self._wait_for_input_completion(event.task_id)
+
+            if task_model is None:
+                logger.error(f"任务 {event.task_id} 在等待用户输入时未找到")
+                raise TaskExecutionError(f"任务 {event.task_id} 在等待用户输入时未找到任务信息")
+
+            # 推送输入完成事件
+            await self._state_manager.push_message(
+                MessageData(event_type=MessageEventType.USER_INPUT_COMPLETED, data=task_model.model_dump())
+            )
+
+            # 继续执行任务
+            await agent.continue_task(event.task_id, task_model.user_input)
+
+        except Exception as e:
+            raise TaskExecutionError(f"等待用户输入失败 task_id={event.task_id}: {e}")
+
+    async def _wait_for_input_completion(self, task_id: str) -> Optional[LinsightExecuteTask]:
+        """等待用户输入完成"""
+        while True:
+            self._check_termination()
+
+            task_model = await self._state_manager.get_execution_task(task_id)
+            if task_model is None:
+                raise ValueError(f"任务 {task_id} 不存在")
+
+            if task_model.status == ExecuteTaskStatusEnum.USER_INPUT_COMPLETED:
+                return task_model
+
+            await asyncio.sleep(1)
+
+    # ==================== 终止检查 ====================
+
+    def _check_termination(self):
+        """检查是否被终止"""
+        if self._is_terminated:
+            logger.info("检测到终止信号，准备终止智能体任务")
+            raise UserTerminationError("任务被用户终止")
+
+    async def _start_termination_monitor(self, session_model: LinsightSessionVersion):
+        """启动终止监控"""
+
+        async def monitor():
+            while not self._is_terminated:
+                try:
+                    if await self._check_user_termination():
+                        self._is_terminated = True
+                        await self._handle_user_termination(session_model)
+                        break
+                    await asyncio.sleep(self.USER_TERMINATION_CHECK_INTERVAL)
+                except Exception as e:
+                    logger.error(f"终止监控异常: {e}")
+                    await asyncio.sleep(self.USER_TERMINATION_CHECK_INTERVAL)
+
+        self._termination_task = asyncio.create_task(monitor())
+
+    async def _stop_termination_monitor(self):
+        """停止终止监控"""
+        if self._termination_task and not self._termination_task.done():
+            self._termination_task.cancel()
+            try:
+                await self._termination_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _check_user_termination(self) -> bool:
+        """检查用户是否主动终止"""
+        if self._is_terminated:
+            return True
+
+        try:
+            current_session = await self._state_manager.get_session_version_info()
+            return (current_session and
+                    current_session.status == SessionVersionStatusEnum.TERMINATED)
+        except Exception as e:
+            logger.error(f"检查用户终止状态失败: {e}")
+            return False
+
+    async def _handle_user_termination(self, session_model: LinsightSessionVersion):
+        """处理用户主动终止"""
+        logger.info(f"处理用户终止 {session_model.id}")
+
+        session_model.status = SessionVersionStatusEnum.TERMINATED
+        session_model.output_result = {"answer": "任务已被用户主动停止"}
+
+        await self._state_manager.set_session_version_info(session_model)
+
+        await self._state_manager.push_message(
+            MessageData(
+                event_type=MessageEventType.TASK_TERMINATED,
+                data={
+                    "message": "任务已被用户主动停止",
+                    "session_id": session_model.id,
+                    "terminated_at": datetime.now().isoformat()
+                }
+            )
+        )
+
+    # ==================== 任务完成处理 ====================
+
+    async def _handle_task_completion(self, session_model: LinsightSessionVersion, llm: BishengLLM, file_dir: str):
+        """处理任务完成"""
+        if not self._final_result:
+            logger.error("没有找到最终任务结果")
+            return
+
+        if self._final_result.status == TaskStatus.SUCCESS.value:
+            await self._handle_task_success(session_model, llm, file_dir)
+        else:
+            await self._handle_task_failure(session_model, "任务执行失败")
+
+    async def _handle_task_success(self, session_model: LinsightSessionVersion, llm: BishengLLM, file_dir: str):
+        """处理任务成功"""
+        try:
+            # 读取文件目录文件详情
+            file_details = await self._read_file_directory(file_dir)
+            logger.debug(f"读取文件目录文件详情: {file_details}")
+
+            # 最终结果文件
+            final_result_files = []
+
+            for file_info in file_details:
+                file_name: str = file_info["file_name"]
+                # 判断文件名是否在self._final_result.answer字符串中
+                if file_name in self._final_result.answer:
+                    # 如果文件名在答案中，添加到答案中
+                    final_result_files.append({
+                        "file_name": file_name,
+                        "file_path": file_info["file_path"],
+                        "file_md5": file_info["file_md5"],
+                        "file_id": file_info["file_id"]
+                    })
+
+            async def upload_file_to_minio(final_file_info: Dict) -> dict | None:
+                """上传文件到MinIO并返回文件信息"""
+                try:
+                    object_name = f"linsight/final_result/{session_model.id}/{final_file_info['file_name']}"
+                    # Use async upload if available, otherwise wrap sync call
+                    await sync_func_to_async(minio_client.upload_minio)(
+                        bucket_name=minio_client.bucket,
+                        object_name=object_name,
+                        file_path=final_file_info["file_path"]
+                    )
+                    final_file_info["file_url"] = object_name
+                    return final_file_info
+                except Exception as e:
+                    logger.error(f"上传文件到MinIO失败 {final_file_info['file_name']}: {e}")
+                    return None
+
+            # 上传文件到MinIO (并行处理)
+            if final_result_files:
+                upload_tasks = [
+                    upload_file_to_minio(final_file_info)
+                    for final_file_info in final_result_files
+                ]
+
+                upload_results = await asyncio.gather(*upload_tasks, return_exceptions=True)
+
+                # 过滤掉失败的上传结果
+                final_result_files = [
+                    result for result in upload_results
+                    if result is not None and not isinstance(result, Exception)
+                ]
+
+                # 记录失败的上传
+                failed_uploads = [
+                    result for result in upload_results
+                    if isinstance(result, Exception)
+                ]
+                if failed_uploads:
+                    logger.warning(f"部分文件上传失败: {len(failed_uploads)} 个文件")
+
+            # 更新会话状态
+            session_model.status = SessionVersionStatusEnum.COMPLETED
+            session_model.output_result = {
+                "answer": self._final_result.answer,
+                "final_files": final_result_files
+            }
+
+            # 保存会话信息并推送消息
+            await self._state_manager.set_session_version_info(session_model)
+            await self._state_manager.push_message(
+                MessageData(
+                    event_type=MessageEventType.FINAL_RESULT,
+                    data=session_model.model_dump()
+                )
+            )
+
+            # 保存SOP
+            await self._save_sop(session_model, llm)
+
+            logger.info(f"任务成功完成，处理了 {len(final_result_files)} 个文件")
+
+        except Exception as e:
+            logger.error(f"处理任务成功时发生错误: {e}")
+            raise TaskExecutionError(f"处理任务成功时发生错误: {e}")
+
+    async def _handle_task_failure(self, session_model: LinsightSessionVersion, error_msg: str):
+        """处理任务失败"""
+        session_model.status = SessionVersionStatusEnum.TERMINATED
+        await self._state_manager.set_session_version_info(session_model)
+        await self._state_manager.push_message(
+            MessageData(event_type=MessageEventType.ERROR_MESSAGE, data={"error": error_msg})
+        )
+
+    async def _handle_execution_error(self, session_version_id: str, error: Exception):
+        """处理执行错误"""
+        try:
+            session_model = await LinsightSessionVersionDao.get_by_id(session_version_id)
+            await self._handle_task_failure(session_model, str(error))
+        except Exception as e:
+            logger.error(f"处理执行错误失败: session_version_id={session_version_id}, error={e}")
+
+    # 读取文件目录文件详情
+    @staticmethod
+    async def _read_file_directory(file_dir: str) -> List[Dict[str, str]]:
+        """读取文件目录中的文件详情"""
+        if not file_dir or not os.path.exists(file_dir):
+            return []
+
+        files = util.read_files_in_directory(file_dir)
+        file_details = []
+        for file in files:
+            file_md5 = await util.async_calculate_md5(file)
+            file_details.append({
+                "file_name": os.path.basename(file),
+                "file_path": file,
+                "file_md5": file_md5,
+                "file_id": os.path.basename(file).split('.')[0]
+            })
+
+        return file_details
+
+    # ==================== SOP处理 ====================
+
+    async def _save_sop(self, session_model: LinsightSessionVersion, llm: BishengLLM):
+        """保存SOP"""
+        try:
+
+            sop_summary = await self.generate_sop_summary(session_model.sop, llm)
+
+            sop_model = await LinsightSOPDao.get_sop_by_session_id(session_model.session_id)
+
+            if not sop_model:
+                sop_obj = SOPManagementSchema(
+                    name=sop_summary["sop_title"],
+                    description=sop_summary["sop_description"],
+                    content=session_model.sop,
+                    rating=0,
+                    linsight_session_id=session_model.session_id
+                )
+
+                await SOPManageService.add_sop(sop_obj, session_model.user_id)
+            else:
+                sop_model.name = sop_summary["sop_title"]
+                sop_model.description = sop_summary["sop_description"]
+                sop_model.content = session_model.sop
+
+                await SOPManageService.update_sop(SOPManagementUpdateSchema.model_validate(sop_model))
+
+        except Exception as e:
+            logger.error(f"保存SOP失败: session_version_id={session_model.id}, error={e}")
+
+    @staticmethod
+    async def generate_sop_summary(sop_content: str, llm: BishengLLM) -> Dict[str, str]:
+        """生成SOP摘要"""
+        default_summary = {"sop_title": "SOP名称", "sop_description": "SOP描述"}
+
+        try:
+            prompt_service = app_ctx.get_prompt_loader()
+            prompt_obj = prompt_service.render_prompt(
+                namespace="sop",
+                prompt_name="gen_sop_summary",
+                sop_detail=sop_content
+            )
+
+            prompt = [
+                ("system", prompt_obj.prompt.system),
+                ("user", prompt_obj.prompt.user)
+            ]
+
+            response = await llm.ainvoke(prompt)
+            if not response.content:
+                logger.error("LLM返回内容为空")
+                return default_summary
+
+            return json.loads(response.content)
+
+        except Exception as e:
+            logger.error(f"生成SOP摘要失败: {e}")
+            return default_summary

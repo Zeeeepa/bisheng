@@ -29,10 +29,11 @@ class WorkStationService(BaseService):
         """ 更新workflow的默认模型配置 """
         config = ConfigDao.get_config(ConfigKeyEnum.WORKSTATION)
         if config:
-            config.value = json.dumps(data.dict())
+            config.value = data.model_dump_json()
         else:
             config = Config(key=ConfigKeyEnum.WORKSTATION.value, value=json.dumps(data.dict()))
         ConfigDao.insert_config(config)
+
         return data
 
     @classmethod
@@ -51,16 +52,37 @@ class WorkStationService(BaseService):
             if ret.webSearch and not ret.webSearch.params:
                 ret.webSearch.tool = 'bing'
                 ret.webSearch.params = {'api_key': ret.webSearch.bingKey, 'base_url': ret.webSearch.bingUrl}
+
+            return ret
+        return None
+
+    @classmethod
+    async def aget_config(cls) -> WorkstationConfig | None:
+        """ 异步获取工作台的默认配置 """
+        config = await ConfigDao.aget_config(ConfigKeyEnum.WORKSTATION)
+        if config:
+            ret = json.loads(config.value)
+            ret = WorkstationConfig(**ret)
+            if ret.assistantIcon and ret.assistantIcon.relative_path:
+                ret.assistantIcon.image = cls.get_logo_share_link(ret.assistantIcon.relative_path)
+            if ret.sidebarIcon and ret.sidebarIcon.relative_path:
+                ret.sidebarIcon.image = cls.get_logo_share_link(ret.sidebarIcon.relative_path)
+
+            # 兼容旧的websearch配置
+            if ret.webSearch and not ret.webSearch.params:
+                ret.webSearch.tool = 'bing'
+                ret.webSearch.params = {'api_key': ret.webSearch.bingKey, 'base_url': ret.webSearch.bingUrl}
+
             return ret
         return None
 
     @classmethod
     async def uploadPersonalKnowledge(
-        cls,
-        request: Request,
-        login_user: UserPayload,
-        file_path,
-        background_tasks: BackgroundTasks,
+            cls,
+            request: Request,
+            login_user: UserPayload,
+            file_path,
+            background_tasks: BackgroundTasks,
     ):
         # 查询是否有个人知识库
         knowledge = KnowledgeDao.get_user_knowledge(login_user.user_id, None,
@@ -84,11 +106,11 @@ class WorkStationService(BaseService):
 
     @classmethod
     def queryKnowledgeList(
-        cls,
-        request: Request,
-        login_user: UserPayload,
-        page: int,
-        size: int,
+            cls,
+            request: Request,
+            login_user: UserPayload,
+            page: int,
+            size: int,
     ):
         # 查询是否有个人知识库
         knowledge = KnowledgeDao.get_user_knowledge(login_user.user_id, None,

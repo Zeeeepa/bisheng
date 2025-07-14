@@ -1,0 +1,696 @@
+import logging
+import os
+import uuid
+from typing import Dict, List, Optional, AsyncGenerator, Tuple
+
+from bisheng.api.services.tool import ToolServices
+from bisheng.api.services.workstation import WorkStationService
+from bisheng.api.v1.schema.inspiration_schema import SOPManagementUpdateSchema, SOPManagementSchema
+from bisheng.database.models.linsight_sop import LinsightSOPDao
+from bisheng.interface.embeddings.custom import FakeEmbedding
+from bisheng.settings import settings
+from bisheng.utils.minio_client import minio_client
+from bisheng.utils.util import calculate_md5
+from fastapi import UploadFile
+from langchain_core.runnables import run_in_executor
+from langchain_core.tools import BaseTool
+
+from bisheng.api.services.assistant_agent import AssistantAgent
+from bisheng.api.services.knowledge_imp import read_chunk_text, decide_vectorstores
+from bisheng.api.services.linsight.sop_manage import SOPManageService
+from bisheng.api.services.llm import LLMService
+from bisheng.api.services.user_service import UserPayload
+from bisheng.api.v1.schema.linsight_schema import LinsightQuestionSubmitSchema
+from bisheng.cache.redis import redis_client
+from bisheng.cache.utils import save_file_to_folder, CACHE_DIR
+from bisheng.core.app_context import app_ctx
+from bisheng.database.models import LinsightSessionVersion
+from bisheng.database.models.flow import FlowType
+from bisheng.database.models.linsight_execute_task import LinsightExecuteTaskDao, LinsightExecuteTask
+from bisheng.database.models.linsight_session_version import LinsightSessionVersionDao
+from bisheng.database.models.session import MessageSessionDao, MessageSession
+from bisheng.interface.llms.custom import BishengLLM
+from bisheng.utils.embedding import decide_embeddings
+
+logger = logging.getLogger(__name__)
+
+
+class LinsightWorkbenchImpl:
+    """Linsight工作台实现类"""
+
+    # 类常量
+    COLLECTION_NAME_PREFIX = "col_linsight_file_"
+    FILE_INFO_REDIS_KEY_PREFIX = "linsight_file:"
+    CACHE_EXPIRATION_HOURS = 24
+
+    class LinsightError(Exception):
+        """Linsight相关错误"""
+        pass
+
+    @classmethod
+    async def submit_user_question(cls, submit_obj: LinsightQuestionSubmitSchema,
+                                   login_user: UserPayload) -> tuple[MessageSession, LinsightSessionVersion]:
+        """
+        提交用户问题并创建会话
+
+        Args:
+            submit_obj: 提交的问题对象
+            login_user: 登录用户信息
+
+        Returns:
+            tuple: (消息会话模型, 灵思会话版本模型)
+
+        Raises:
+            LinsightError: 当创建会话失败时
+        """
+        try:
+            # 生成唯一会话ID
+            chat_id = uuid.uuid4().hex
+
+            # 创建消息会话
+            message_session = MessageSession(
+                chat_id=chat_id,
+                flow_id='',
+                flow_name='新对话',
+                flow_type=FlowType.LINSIGHT.value,
+                user_id=login_user.user_id
+            )
+            await MessageSessionDao.async_insert_one(message_session)
+
+            # 处理文件（如果存在）
+            processed_files = await cls._process_submitted_files(submit_obj.files, chat_id)
+
+            # 创建灵思会话版本
+            linsight_session_version = LinsightSessionVersion(
+                session_id=chat_id,
+                user_id=login_user.user_id,
+                question=submit_obj.question,
+                tools=submit_obj.tools,
+                org_knowledge_enabled=submit_obj.org_knowledge_enabled,
+                personal_knowledge_enabled=submit_obj.personal_knowledge_enabled,
+                files=processed_files
+            )
+            linsight_session_version = await LinsightSessionVersionDao.insert_one(linsight_session_version)
+
+            return message_session, linsight_session_version
+
+        except Exception as e:
+            logger.error(f"提交用户问题失败: {str(e)}")
+            raise cls.LinsightError(f"提交用户问题失败: {str(e)}")
+
+    @classmethod
+    async def _process_submitted_files(cls, files: Optional[List], chat_id: str) -> Optional[List]:
+        """
+        处理提交的文件
+
+        Args:
+            files: 文件列表
+            chat_id: 会话ID
+
+        Returns:
+            处理后的文件列表
+        """
+        if not files:
+            return None
+
+        file_ids = [file.file_id for file in files]
+        redis_keys = [f"{cls.FILE_INFO_REDIS_KEY_PREFIX}{file_id}" for file_id in file_ids]
+
+        processed_files = await redis_client.amget(redis_keys)
+
+        for file_info in processed_files:
+            if file_info:
+                await cls._copy_file_to_session_storage(file_info, chat_id)
+
+        return processed_files
+
+    @classmethod
+    async def _copy_file_to_session_storage(cls, file_info: Dict, chat_id: str) -> None:
+        """
+        复制文件到会话存储
+
+        Args:
+            file_info: 文件信息
+            chat_id: 会话ID
+        """
+        source_object_name = file_info.get("markdown_file_path")
+
+        original_filename = file_info.get("original_filename")
+
+        if source_object_name:
+            markdown_filename = f"{original_filename.split('.')[0]}.md"
+            new_object_name = f"linsight/{chat_id}/{markdown_filename}"
+            minio_client.copy_object(
+                source_object_name=source_object_name,
+                target_object_name=new_object_name,
+                bucket_name=minio_client.tmp_bucket,
+                target_bucket_name=minio_client.bucket
+            )
+            file_info["markdown_file_path"] = new_object_name
+            file_info["markdown_filename"] = markdown_filename
+
+    @classmethod
+    async def task_title_generate(cls, question: str, chat_id: str,
+                                  login_user: UserPayload) -> Dict:
+        """
+        生成任务标题
+
+        Args:
+            question: 用户问题
+            chat_id: 会话ID
+            login_user: 登录用户信息
+
+        Returns:
+            包含任务标题的字典
+        """
+        try:
+            # 获取并验证工作台配置
+            workbench_conf = await cls._get_workbench_config()
+
+            # 创建LLM实例
+            llm = BishengLLM(model_id=workbench_conf.task_model.id)
+
+            # 生成prompt
+            prompt = await cls._generate_title_prompt(question)
+
+            # 生成任务标题
+            task_title = await llm.ainvoke(prompt)
+
+            if not task_title.content:
+                raise ValueError("生成任务标题失败，请检查模型配置或输入内容")
+
+            # 更新会话标题
+            await cls._update_session_title(chat_id, task_title.content)
+
+            return {
+                "task_title": task_title.content,
+                "chat_id": chat_id,
+                "error_message": None
+            }
+
+        except Exception as e:
+            logger.error(f"生成任务标题失败: {str(e)}")
+            return {
+                "task_title": None,
+                "chat_id": chat_id,
+                "error_message": str(e)
+            }
+
+    @classmethod
+    async def _get_workbench_config(cls):
+        """获取并验证工作台配置"""
+        workbench_conf = await LLMService.get_workbench_llm()
+        if not workbench_conf or not workbench_conf.task_model:
+            raise ValueError("未配置灵思生成摘要模型，请从工作台配置中设置")
+        return workbench_conf
+
+    @classmethod
+    async def _generate_title_prompt(cls, question: str) -> List[Tuple[str, str]]:
+        """生成标题生成的prompt"""
+        prompt_service = app_ctx.get_prompt_loader()
+        prompt_obj = prompt_service.render_prompt(
+            namespace="gen_title",
+            prompt_name="linsight",
+            USER_GOAL=question
+        )
+        return [
+            ("system", prompt_obj.prompt.system),
+            ("user", prompt_obj.prompt.user)
+        ]
+
+    @classmethod
+    async def _update_session_title(cls, chat_id: str, title: str) -> None:
+        """更新会话标题"""
+        session = await MessageSessionDao.async_get_one(chat_id)
+        if session:
+            session.flow_name = title
+            await MessageSessionDao.async_insert_one(session)
+
+    @classmethod
+    async def get_linsight_session_version_list(cls, session_id: str) -> List[LinsightSessionVersion]:
+        """
+        获取灵思会话版本列表
+
+        Args:
+            session_id: 会话ID
+
+        Returns:
+            灵思会话版本列表
+        """
+        return await LinsightSessionVersionDao.get_session_versions_by_session_id(session_id)
+
+    @classmethod
+    async def modify_sop(cls, linsight_session_version_id: str, sop_content: str) -> Dict:
+        """
+        修改灵思会话版本的SOP内容
+
+        Args:
+            linsight_session_version_id: 会话版本ID
+            sop_content: SOP内容
+
+        Returns:
+            操作结果
+        """
+        try:
+            await LinsightSessionVersionDao.modify_sop_content(
+                linsight_session_version_id=linsight_session_version_id,
+                sop_content=sop_content
+            )
+            return {"success": True, "message": "modify sop content successfully"}
+        except Exception as e:
+            logger.error(f"修改SOP内容失败: {str(e)}")
+            return {"success": False, "message": str(e)}
+
+    @classmethod
+    async def generate_sop(cls, linsight_session_version_id: str,
+                           previous_session_version_id: str,
+                           feedback_content: Optional[str] = None,
+                           reexecute: bool = False,
+                           login_user: Optional[UserPayload] = None) -> AsyncGenerator[Dict, None]:
+        """
+        生成SOP内容
+
+        Args:
+            linsight_session_version_id: 当前会话版本ID
+            previous_session_version_id: 上一个会话版本ID
+            feedback_content: 反馈内容
+            reexecute: 是否重新执行
+            login_user: 登录用户信息
+
+        Yields:
+            生成的SOP内容事件
+        """
+        try:
+            # 获取工作台配置和会话版本
+            workbench_conf = await cls._get_workbench_config()
+            session_version = await cls._get_session_version(linsight_session_version_id)
+
+            # 创建LLM和工具
+            llm = BishengLLM(model_id=workbench_conf.task_model.id)
+            tools = await cls._prepare_tools(session_version, llm)
+
+            # 准备历史摘要
+            history_summary = await cls._prepare_history_summary(
+                reexecute, previous_session_version_id
+            )
+
+            # 创建代理并生成SOP
+            agent = await cls._create_linsight_agent(session_version, llm, tools, workbench_conf)
+
+            content = ""
+            async for res in cls._generate_sop_content(
+                    agent, session_version, feedback_content, history_summary
+            ):
+                content += res.content
+                yield {
+                    "event": "generate_sop_content",
+                    "data": res.model_dump_json()
+                }
+
+            # 更新SOP内容
+            await LinsightSessionVersionDao.modify_sop_content(
+                linsight_session_version_id=linsight_session_version_id,
+                sop_content=content
+            )
+
+        except Exception as e:
+            logger.error(f"生成SOP失败: {str(e)}")
+            yield {"event": "error", "data": str(e)}
+
+    @classmethod
+    async def _get_session_version(cls, session_version_id: str) -> LinsightSessionVersion:
+        """获取会话版本"""
+        session_version = await LinsightSessionVersionDao.get_by_id(session_version_id)
+        if not session_version:
+            raise cls.LinsightError("灵思会话版本不存在")
+        return session_version
+
+    @classmethod
+    async def _prepare_tools(cls, session_version: LinsightSessionVersion,
+                             llm: BishengLLM) -> List[BaseTool]:
+        """准备工具列表"""
+        tools = await cls.init_linsight_config_tools(session_version, llm)
+
+        root_path = os.path.join(CACHE_DIR, "linsight", session_version.id)
+        os.makedirs(root_path, exist_ok=True)
+
+        linsight_tools = await ToolServices.init_linsight_tools(root_path=root_path)
+        tools.extend(linsight_tools)
+
+        return tools
+
+    @classmethod
+    async def _prepare_history_summary(cls, reexecute: bool,
+                                       previous_session_version_id: str) -> List[str]:
+        """准备历史摘要"""
+        history_summary = []
+
+        if reexecute and previous_session_version_id:
+            execute_tasks = await cls.get_execute_task_detail(previous_session_version_id)
+
+            for task in execute_tasks:
+                if task.result:
+                    answer = task.result.get("answer", "")
+                    if answer:
+                        history_summary.append(answer)
+
+        return history_summary
+
+    @classmethod
+    async def _create_linsight_agent(cls, session_version: LinsightSessionVersion,
+                                     llm: BishengLLM, tools: List[BaseTool],
+                                     workbench_conf):
+        """创建Linsight代理"""
+        from bisheng_langchain.linsight.agent import LinsightAgent
+
+        root_path = os.path.join(CACHE_DIR, "linsight", session_version.id)
+
+        return LinsightAgent(
+            file_dir=root_path,
+            query=session_version.question,
+            llm=llm,
+            tools=tools,
+            task_mode=workbench_conf.linsight_executor_mode,
+            debug=settings.linsight_conf.debug,
+            debug_id=session_version.id
+        )
+
+    @classmethod
+    async def _generate_sop_content(cls, agent, session_version: LinsightSessionVersion,
+                                    feedback_content: Optional[str],
+                                    history_summary: List[str]) -> AsyncGenerator:
+        """生成SOP内容"""
+        if feedback_content is None:
+            # 检索SOP模板
+            sop_template = await SOPManageService.search_sop(
+                query=session_version.question, k=3
+            )
+            sop_template = "\n\n".join([
+                f"例子:\n\n{sop.page_content}"
+                for sop in sop_template if sop.page_content
+            ])
+
+            async for res in agent.generate_sop(sop=sop_template):
+                yield res
+        else:
+            sop_template = session_version.sop if session_version.sop else ""
+            if sop_template:
+                sop_template = f"例子:\n\n{sop_template}"
+
+            async for res in agent.feedback_sop(
+                    sop=sop_template,
+                    feedback=feedback_content,
+                    history_summary=history_summary if history_summary else None
+            ):
+                yield res
+
+    @classmethod
+    async def get_execute_task_detail(cls, session_version_id: str,
+                                      login_user: Optional[UserPayload] = None) -> List[LinsightExecuteTask]:
+        """
+        获取执行任务详情
+
+        Args:
+            session_version_id: 灵思会话版本ID
+            login_user: 登录用户信息
+
+        Returns:
+            执行任务详情列表
+        """
+        execute_tasks = await LinsightExecuteTaskDao.get_by_session_version_id(session_version_id)
+        return execute_tasks or []
+
+    @classmethod
+    async def upload_file(cls, file: UploadFile) -> Dict:
+        """
+        上传文件到灵思工作台
+
+        Args:
+            file: 上传的文件
+
+        Returns:
+            文件信息字典
+        """
+        # 生成文件信息
+        file_id = uuid.uuid4().hex
+        original_filename = file.filename
+        file_extension = original_filename.split('.')[-1] if '.' in original_filename else ''
+        unique_filename = f"{file_id}.{file_extension}"
+
+        # 保存文件
+        file_path = await save_file_to_folder(file, 'linsight', unique_filename)
+
+        return {
+            "file_id": file_id,
+            "filename": unique_filename,
+            "original_filename": original_filename,
+            "file_path": file_path,
+            "parsing_status": "pending",
+        }
+
+    @classmethod
+    async def parse_file(cls, upload_result: Dict) -> Dict:
+        """
+        解析上传的文件
+
+        Args:
+            upload_result: 上传结果
+
+        Returns:
+            解析结果
+        """
+        file_id = upload_result["file_id"]
+        original_filename = upload_result["original_filename"]
+        file_path = upload_result["file_path"]
+
+        # 获取工作台配置
+        workbench_conf = await cls._get_workbench_config()
+        collection_name = f"{cls.COLLECTION_NAME_PREFIX}{workbench_conf.embedding_model.id}"
+
+        # 异步执行文件解析
+        parse_result = await run_in_executor(
+            None,
+            cls._parse_file_sync,
+            file_id, file_path, original_filename, collection_name, workbench_conf
+        )
+
+        # 缓存解析结果
+        await cls._cache_parse_result(file_id, parse_result)
+
+        return parse_result
+
+    @classmethod
+    def _parse_file_sync(cls, file_id: str, file_path: str, original_filename: str,
+                         collection_name: str, workbench_conf) -> Dict:
+        """
+        同步解析文件
+
+        Args:
+            file_id: 文件ID
+            file_path: 文件路径
+            original_filename: 原始文件名
+            collection_name: 集合名称
+            workbench_conf: 工作台配置
+
+        Returns:
+            解析结果
+        """
+        # 读取文件内容
+        texts, _, parse_type, _ = read_chunk_text(
+            input_file=file_path,
+            file_name=original_filename,
+            separator=['\n\n', '\n'],
+            separator_rule=['after', 'after'],
+            chunk_size=1000,
+            chunk_overlap=100,
+            no_summary=True
+        )
+
+        # 生成markdown内容
+        markdown_content = "\n".join(texts)
+        markdown_bytes = markdown_content.encode('utf-8')
+
+        # 保存markdown文件
+        markdown_filename = f"{file_id}.md"
+        minio_client.upload_tmp(markdown_filename, markdown_bytes)
+        markdown_md5 = calculate_md5(markdown_bytes)
+
+        # 处理向量存储
+        cls._process_vector_storage(texts, file_id, collection_name, workbench_conf)
+
+        return {
+            "file_id": file_id,
+            "original_filename": original_filename,
+            "parsing_status": "completed",
+            "parse_type": parse_type,
+            "markdown_filename": markdown_filename,
+            "markdown_file_path": markdown_filename,
+            "markdown_file_md5": markdown_md5,
+            "embedding_model_id": workbench_conf.embedding_model.id,
+            "collection_name": collection_name
+        }
+
+    @classmethod
+    def _process_vector_storage(cls, texts: List[str], file_id: str,
+                                collection_name: str, workbench_conf) -> None:
+        """处理向量存储"""
+        # 创建embeddings
+        embeddings = decide_embeddings(workbench_conf.embedding_model.id)
+
+        # 创建向量存储
+        vector_client = decide_vectorstores(collection_name, "Milvus", embeddings)
+        es_client = decide_vectorstores(collection_name, "ElasticKeywordsSearch", FakeEmbedding())
+
+        # 添加文本到向量存储
+        metadatas = [{"file_id": file_id} for _ in texts]
+        vector_client.add_texts(texts, metadatas=metadatas)
+        es_client.add_texts(texts, metadatas=metadatas)
+
+    @classmethod
+    async def _cache_parse_result(cls, file_id: str, parse_result: Dict) -> None:
+        """缓存解析结果"""
+        key = f"{cls.FILE_INFO_REDIS_KEY_PREFIX}{file_id}"
+        await redis_client.aset(
+            key=key,
+            value=parse_result,
+            expiration=60 * 60 * cls.CACHE_EXPIRATION_HOURS
+        )
+
+    @classmethod
+    async def init_linsight_config_tools(cls, session_version: LinsightSessionVersion,
+                                         llm: BishengLLM) -> List[BaseTool]:
+        """
+        初始化灵思配置的工具
+
+        Args:
+            session_version: 会话版本模型
+            llm: LLM实例
+
+        Returns:
+            工具列表
+        """
+        tools = []
+
+        if not session_version.tools:
+            return tools
+
+        # 提取工具ID
+        tool_ids = cls._extract_tool_ids(session_version.tools)
+
+        # 获取工作台配置的工具ID
+        ws_config = await WorkStationService.aget_config()
+        config_tool_ids = cls._extract_tool_ids(ws_config.linsightConfig.tools or [])
+
+        # 过滤有效的工具ID
+        valid_tool_ids = [tid for tid in tool_ids if tid in config_tool_ids]
+
+        # 初始化工具
+        if valid_tool_ids:
+            tools.extend(await AssistantAgent.init_tools_by_tool_ids(valid_tool_ids, llm=llm))
+
+        return tools
+
+    @classmethod
+    def _extract_tool_ids(cls, tools: List[Dict]) -> List[int]:
+        """
+        从工具配置中提取工具ID
+
+        Args:
+            tools: 工具配置列表
+
+        Returns:
+            工具ID列表
+        """
+        tool_ids = []
+        for tool in tools:
+            if tool.get("children"):
+                tool_ids.extend(int(child.get("id")) for child in tool["children"] if child.get("id"))
+        return tool_ids
+
+    @classmethod
+    async def feedback_regenerate_sop_task(cls, session_version_model: LinsightSessionVersion,
+                                           feedback: str) -> None:
+        """
+        根据反馈重新生成SOP任务
+
+        Args:
+            session_version_model: 灵思会话版本模型
+            feedback: 反馈内容
+        """
+        try:
+            # 获取工作台配置
+            workbench_conf = await cls._get_workbench_config()
+
+            # 创建LLM和工具
+            llm = BishengLLM(model_id=workbench_conf.task_model.id)
+            tools = await cls._prepare_tools(session_version_model, llm)
+
+            # 获取历史摘要
+            history_summary = await cls._get_history_summary(session_version_model.id)
+
+            # 创建代理并生成SOP
+            agent = await cls._create_linsight_agent(session_version_model, llm, tools, workbench_conf)
+
+            sop_content = ""
+            sop_template = session_version_model.sop or ""
+
+            async for res in agent.feedback_sop(
+                    sop=sop_template,
+                    feedback=feedback,
+                    history_summary=history_summary if history_summary else None
+            ):
+                sop_content += res.content
+
+            # 生成SOP摘要并更新数据库
+            await cls._update_sop_in_database(session_version_model, sop_content, llm)
+
+        except Exception as e:
+            logger.error(f"反馈重新生成SOP任务失败: {str(e)}")
+
+    @classmethod
+    async def _get_history_summary(cls, session_version_id: str) -> List[str]:
+        """获取历史摘要"""
+        history_summary = []
+        execute_tasks = await cls.get_execute_task_detail(session_version_id)
+
+        for task in execute_tasks:
+            if task.result:
+                answer = task.result.get("answer", "")
+                if answer:
+                    history_summary.append(answer)
+
+        return history_summary
+
+    @classmethod
+    async def _update_sop_in_database(cls, session_version: LinsightSessionVersion,
+                                      sop_content: str, llm: BishengLLM) -> None:
+        """更新数据库中的SOP"""
+        from bisheng.linsight.task_exec import LinsightWorkflowTask
+
+        # 生成SOP摘要
+        sop_summary = await LinsightWorkflowTask.generate_sop_summary(sop_content, llm)
+
+        # 检查是否已存在SOP
+        existing_sop = await LinsightSOPDao.get_sop_by_session_id(session_version.session_id)
+
+        if existing_sop:
+            # 更新现有SOP
+            update_obj = SOPManagementUpdateSchema(
+                id=existing_sop.id,
+                content=sop_content,
+                name=sop_summary["sop_title"],
+                description=sop_summary["sop_description"],
+                rating=session_version.score,
+                linsight_session_id=session_version.session_id
+            )
+            await SOPManageService.update_sop(update_obj)
+        else:
+            # 创建新SOP
+            create_obj = SOPManagementSchema(
+                content=sop_content,
+                name=sop_summary["sop_title"],
+                description=sop_summary["sop_description"],
+                rating=session_version.score,
+                linsight_session_id=session_version.session_id
+            )
+            await SOPManageService.add_sop(create_obj, user_id=session_version.user_id)

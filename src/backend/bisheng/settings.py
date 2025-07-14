@@ -96,7 +96,7 @@ class WorkflowConf(BaseModel):
 
 
 class CeleryConf(BaseModel):
-    task_routers: Optional[dict] = Field(default_factory=dict, description='任务路由配置')
+    task_routers: Optional[dict] = Field(default_factory=dict, validate_default=True, description='任务路由配置')
 
     @field_validator('task_routers', mode='before')
     def handle_routers(cls, value):
@@ -106,6 +106,11 @@ class CeleryConf(BaseModel):
                 "bisheng.worker.workflow.*": {"queue": "workflow_celery"},  # 工作流执行相关任务
             }
         return value
+
+
+class LinsightConf(BaseModel):
+    debug: bool = Field(default=False, description='是否开启debug模式')
+    max_concurrency: int = Field(default=32, description='单个worker最大并发数')
 
 
 class Settings(BaseModel):
@@ -144,6 +149,7 @@ class Settings(BaseModel):
     gpts: dict = {}
     openai_conf: dict = {}
     minio_conf: dict = {}
+    linsight_conf: LinsightConf = LinsightConf()
     logger_conf: LoggerConf = LoggerConf()
     password_conf: PasswordConf = PasswordConf()
     system_login_method: SystemLoginMethod = {}
