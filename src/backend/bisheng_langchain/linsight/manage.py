@@ -221,7 +221,7 @@ class TaskManage(BaseModel):
         for task in self.tasks:
             if task.status == TaskStatus.SUCCESS.value:
                 success_steps.append(task.step_id)
-        return ','.join(success_steps)
+        return "你现在已经完成了" + ",".join(success_steps) if success_steps else ''
 
     def get_workflow(self):
         res = []
@@ -231,7 +231,7 @@ class TaskManage(BaseModel):
             res.append({
                 'step_id': task.step_id,
                 'target': task.target,
-                'description': task.status
+                'description': task.description
             })
         return res
 
@@ -245,7 +245,7 @@ class TaskManage(BaseModel):
 
     async def ainvoke_task(self) -> AsyncIterator[BaseEvent]:
         for task in self.tasks:
-            asyncio.create_task(self.catch_task_exception(task))
+            async_task = asyncio.create_task(self.catch_task_exception(task))
             while task.status not in [TaskStatus.SUCCESS.value, TaskStatus.FAILED.value]:
                 while not self.aqueue.empty():
                     res = await self.aqueue.get()
@@ -254,6 +254,8 @@ class TaskManage(BaseModel):
             while not self.aqueue.empty():
                 res = await self.aqueue.get()
                 yield res
+            if task_exception := async_task.exception():
+                raise task_exception
             if task.status == TaskStatus.FAILED.value:
                 raise Exception(f"Task {task.step_id} failed with error: {task.get_answer()}")
 
