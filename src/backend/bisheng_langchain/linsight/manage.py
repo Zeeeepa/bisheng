@@ -25,7 +25,8 @@ class TaskManage(BaseModel):
     """
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    tasks: list[dict | Task] = Field(default_factory=list, description='List of tasks managed by the task manager')
+    tasks: list[dict | Task] = Field(default_factory=list,
+                                     description='List of tasks managed by the task manager, not include sub task')
     task_map: dict[str, Task] = Field(default_factory=dict, description='Map of task IDs to Task instances')
     task_step_map: dict[str, Task] = Field(default_factory=dict, description='Map of step ID to Task instances')
     tools: list[BaseTool] = Field(default_factory=list, description='List of tools managed by the tool manager')
@@ -124,6 +125,7 @@ class TaskManage(BaseModel):
                 "name": "call_user_help",
                 "description": "在你需要用户帮助或确认内容的时候调用此工具，例如解决问题的规划，执行一个比较耗时的操作，并且请说明需要人类确认的原因。",
                 "parameters": {
+                    "type": "object",
                     "properties": {
                         "_call_reason": {
                             "type": "string",
@@ -133,8 +135,7 @@ class TaskManage(BaseModel):
                 },
                 "required": [
                     "_call_reason"
-                ],
-                "type": "object"
+                ]
             }
         })
         return res
@@ -206,7 +207,6 @@ class TaskManage(BaseModel):
 
         """
         for task in tasks:
-            self.tasks.append(task)
             self.task_map[task.id] = task
 
     def get_step_answer(self, step_id: str) -> str:

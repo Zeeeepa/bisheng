@@ -8,7 +8,8 @@ from bisheng_langchain.linsight.const import TaskStatus
 from bisheng_langchain.linsight.event import NeedUserInput, ExecStep
 from bisheng_langchain.linsight.react_prompt import ReactSingleAgentPrompt, ReactLoopAgentPrompt
 from bisheng_langchain.linsight.task import BaseTask
-from bisheng_langchain.linsight.utils import encode_str_tokens, extract_code_blocks, generate_uuid_str
+from bisheng_langchain.linsight.utils import encode_str_tokens, generate_uuid_str, \
+    extract_json_from_markdown
 
 
 class ReactTask(BaseTask):
@@ -74,14 +75,7 @@ class ReactTask(BaseTask):
         return [HumanMessage(content=prompt)]
 
     async def parse_react_result(self, content: str) -> (BaseMessage, bool):
-        response_json = extract_code_blocks(content)
-        try:
-            response_json = json.loads(response_json)
-        except json.decoder.JSONDecodeError:
-            try:
-                response_json = json.loads(content)
-            except json.decoder.JSONDecodeError:
-                raise Exception("无法从模型返回的数据中提取出JSON格式的数据: " + content)
+        response_json = extract_json_from_markdown(content)
         step_type = response_json.get("类型", "未知")
         thinking = response_json.get("思考", "未提供思考过程")
         action = response_json.get("行动", "")
@@ -104,7 +98,7 @@ class ReactTask(BaseTask):
 
         if step_type == "固定步骤":
             result_dict = {
-                "结束": is_end,
+                "结束": "True" if is_end else "False",
                 "思考": thinking,
                 "类型": step_type,
                 "行动": action,
@@ -113,7 +107,7 @@ class ReactTask(BaseTask):
             }
             await self.put_event(ExecStep(task_id=self.id,
                                           call_id=generate_uuid_str(),
-                                          call_reason=thinking,
+                                          call_reason=response_json.get("调用原因", ""),
                                           name=action,
                                           params=params,
                                           output=str(generate_content),
@@ -152,7 +146,7 @@ class ReactTask(BaseTask):
                                               output=observation,
                                               status="end"))
             result_dict = {
-                "结束": is_end,
+                "结束": "True" if is_end else "False",
                 "思考": thinking,
                 "类型": "工具",
                 "行动": action,
