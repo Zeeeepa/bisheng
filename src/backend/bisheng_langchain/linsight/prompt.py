@@ -145,6 +145,20 @@ LoopAgentSplitPrompt = """你是一名专业的流程拆解专家，请根据用
 5. 当前方法。当前方法要参考总体方法，例如使用工具的情况不能遗漏。
 6. 输出方法。例如总结回答，写入文件，生成图片路径等等,如果为写入文件，需要明确文件地址。
 
+
+用户最终问题: 
+{query}
+
+用户提供的完整SOP: 
+{sop}
+
+这是任务整体规划：
+{workflow}
+
+你现在已经完成了{processed_steps}
+
+{input_str}
+
 请用以下格式模板响应：
 ```json
 {{
@@ -174,19 +188,6 @@ LoopAgentSplitPrompt = """你是一名专业的流程拆解专家，请根据用
   ]
 }}
 ```
-
-用户最终问题: 
-{query}
-
-用户提供的完整SOP: 
-{sop}
-
-这是任务整体规划：
-{workflow}
-
-你现在已经完成了{processed_steps}
-
-{input_str}
 
 阶段问题：
 {prompt}"""
@@ -238,3 +239,22 @@ SummarizeHistoryPrompt = """请基于以下对话历史记录尝试回答用户�
 {history_str}
 
 回答："""
+
+# 总结答案的prompt模板, 用于总结一个Agent的执行内容，提取出下一个Agent需要的信息
+# variables -> history_str: 已经执行的步骤内容；workflow: 任务整体规划；step_id: 当前任务的step_id；depend_step: 依赖当前任务的step_id
+SummarizeAnswerPrompt = """现在有一个多Agent系统，现在给你其中一个Agent执行的所有步骤内容，你需要总结这个Agent传递给其他Agent所必要的信息。
+已经执行的步骤内容：
+{history_str}
+
+任务整体规划：
+{workflow}
+
+当前任务为：{step_id}。
+
+依赖你输出的任务是{depend_step}。
+
+输出内容需要放入json结构体中，json结构体如下：
+```json
+```
+
+现在你需要总结出所有{depend_step}所需要本任务输出的内容："""

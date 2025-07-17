@@ -158,7 +158,7 @@ class LinsightWorkbenchImpl:
         source_object_name = file_info.get("markdown_file_path")
         if source_object_name:
             original_filename = file_info.get("original_filename")
-            markdown_filename = f"{original_filename.split('.')[0]}.md"
+            markdown_filename = f"{original_filename.rsplit('.', 1)[0]}.md"
             new_object_name = f"linsight/{chat_id}/{source_object_name}"
             minio_client.copy_object(
                 source_object_name=source_object_name,
@@ -755,7 +755,7 @@ class LinsightWorkbenchImpl:
             agent = await cls._create_linsight_agent(session_version_model, llm, tools, workbench_conf)
 
             sop_content = ""
-            sop_template = session_version_model.sop or ""
+            sop_template = f"例子:\n\n{session_version_model.sop or ''}"
 
             async for res in agent.feedback_sop(
                     sop=sop_template,

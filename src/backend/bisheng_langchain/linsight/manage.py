@@ -109,6 +109,8 @@ class TaskManage(BaseModel):
         res = []
         for one in self.tools:
             schema = convert_to_openai_tool(one)
+            if "_call_reason" in schema["function"]["parameters"]["properties"]:
+                continue
             # 所有的工具都加一个调用原因的字段
             schema["function"]["parameters"]["properties"]["_call_reason"] = {
                 "type": "string",
@@ -148,11 +150,12 @@ class TaskManage(BaseModel):
         """
         return json.dumps(self.get_all_tool_schema, ensure_ascii=False, indent=2)
 
-    async def ainvoke_tool(self, name: str, params: dict) -> str:
+    async def ainvoke_tool(self, name: str, params: dict) -> (str, bool):
         """
         Add a new tool to the tool manager.
         :param name: The name of the tool to be executed.
         :param params: The params of the tool to be invoked.
+        :return: A tuple containing the result of the tool execution and a boolean indicating success.
         """
         if name not in self.tool_map:
             return f"tool {name} exec error, because tool name is not found"
@@ -160,10 +163,10 @@ class TaskManage(BaseModel):
             res = await self.tool_map[name].ainvoke(input=params)
             if not isinstance(res, str):
                 res = str(res)
-            return res
+            return res, True
         except Exception as e:
             traceback.print_exc()
-            return f"tool {name} exec error, something went wrong: {str(e)[:20]}"
+            return f"tool {name} exec error, something went wrong: {str(e)[:20]}", False
 
     @classmethod
     def completion_task_tree_info(cls, original_task: list[dict]) -> list[dict]:
@@ -209,11 +212,11 @@ class TaskManage(BaseModel):
         for task in tasks:
             self.task_map[task.id] = task
 
-    def get_step_answer(self, step_id: str) -> str:
+    async def get_step_answer(self, step_id: str) -> str:
         """ 获取某个步骤的答案 """
         if step_id not in self.task_step_map:
             return ""
-        return self.task_step_map[step_id].get_answer()
+        return await self.task_step_map[step_id].get_answer()
 
     def get_processed_steps(self):
         """Get the steps that have been processed."""
@@ -222,6 +225,13 @@ class TaskManage(BaseModel):
             if task.status == TaskStatus.SUCCESS.value:
                 success_steps.append(task.step_id)
         return "你现在已经完成了" + ",".join(success_steps) if success_steps else ''
+
+    def get_depend_step(self, step_id: str) -> str:
+        result = ""
+        for task in self.tasks:
+            if step_id in task.input:
+                result += f"{task.step_id},"
+        return result.rstrip(",")
 
     def get_workflow(self):
         res = []

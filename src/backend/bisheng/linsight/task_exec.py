@@ -677,7 +677,7 @@ class LinsightWorkflowTask:
                 "file_name": os.path.basename(file),
                 "file_path": file,
                 "file_md5": file_md5,
-                "file_id": os.path.basename(file).split('.')[0]
+                "file_id": os.path.basename(file).rsplit('.', 1)[0]
             })
 
         return file_details
@@ -703,11 +703,14 @@ class LinsightWorkflowTask:
 
                 await SOPManageService.add_sop(sop_obj, session_model.user_id)
             else:
-                sop_model.name = sop_summary["sop_title"]
-                sop_model.description = sop_summary["sop_description"]
-                sop_model.content = session_model.sop
-
-                await SOPManageService.update_sop(SOPManagementUpdateSchema.model_validate(sop_model))
+                await SOPManageService.update_sop(SOPManagementUpdateSchema(
+                    id=sop_model.id,
+                    name=sop_summary["sop_title"],
+                    description=sop_summary["sop_description"],
+                    content=session_model.sop,
+                    rating=sop_model.rating,
+                    linsight_session_id=sop_model.linsight_session_id
+                ))
 
         except Exception as e:
             logger.error(f"保存SOP失败: session_version_id={session_model.id}, error={e}")
