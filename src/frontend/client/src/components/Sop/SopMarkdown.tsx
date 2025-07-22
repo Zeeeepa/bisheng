@@ -1,13 +1,13 @@
 import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
 import Vditor from "vditor";
 import "vditor/dist/index.css";
-import SopToolsDown from "./SopToolsDown";
 import { useGetLinsightToolList, useGetOrgToolList, useGetPersonalToolList } from '~/data-provider';
+import { LinsightInfo } from "~/store/linsight";
+import { SopStatus } from "./SOPEditor";
+import SopToolsDown from "./SopToolsDown";
 
 interface MarkdownProps {
-    value?: string | null;
-    files?: any[]; // 根据实际情况调整类型
-    tools?: any[]; // 根据实际情况调整类型
+    linsight: LinsightInfo,
     edit?: boolean;
 }
 
@@ -15,15 +15,16 @@ interface MarkdownRef {
     getValue: () => string;
 }
 
-const Markdown = forwardRef<MarkdownRef, MarkdownProps>((props, ref) => {
-    const { value = '', files, tools, edit } = props;
+const SopMarkdown = forwardRef<MarkdownRef, MarkdownProps>((props, ref) => {
+    const { linsight, edit, onChange } = props;
+    const { sop: value = '', inputSop, files, tools } = linsight
 
     const veditorRef = useRef<any>(null);
     const inserRef = useRef<any>(null);
     const boxRef = useRef<any>(null);
     const scrollBoxRef = useRef<any>(null);
 
-    const { nameToValueRef, valueToNameRef, buildTreeData: toolOptions } = useSopTools(files, tools)
+    const { nameToValueRef, valueToNameRef, buildTreeData: toolOptions } = useSopTools(linsight)
 
     useEffect(() => {
         const vditorDom = document.getElementById('vditor');
@@ -43,6 +44,7 @@ const Markdown = forwardRef<MarkdownRef, MarkdownProps>((props, ref) => {
                 veditorRef.current = vditor;
                 scrollBoxRef.current = vditorDom.querySelector('.vditor-reset');
             },
+            input: onChange,
             hint: {
                 parse: false, // 必须
                 placeholder: {
@@ -83,14 +85,16 @@ const Markdown = forwardRef<MarkdownRef, MarkdownProps>((props, ref) => {
     }, []);
 
     useEffect(() => {
-        if (value === '' || value) {
+        // 用户输入同步value to markdown
+        if (!inputSop && (value === '' || value)) {
+            // 回显值
             veditorRef.current?.setValue(replaceMarkersToBraces(value, valueToNameRef.current))
         }
 
-        if (scrollBoxRef.current) {
+        if (scrollBoxRef.current && linsight.status !== SopStatus.SopGenerated) {
             scrollBoxRef.current.scrollTop = scrollBoxRef.current.scrollHeight
         }
-    }, [value])
+    }, [value, linsight.status, inputSop])
 
     // 开启/禁用
     useEffect(() => {
@@ -114,9 +118,11 @@ const Markdown = forwardRef<MarkdownRef, MarkdownProps>((props, ref) => {
     console.log('toolOptions :>> ', toolOptions);
 
     const handleChange = (val) => {
-        inserRef.current(`{{${val.label}}}`);
+        inserRef.current(`{{@${val.label}@}}`);
         setMenuOpen(false)
     }
+
+    useAtTip(scrollBoxRef)
 
     return <div ref={boxRef} className="relative h-full">
         <div id="vditor" className="linsight-vditor border-none" />
@@ -134,11 +140,13 @@ const Markdown = forwardRef<MarkdownRef, MarkdownProps>((props, ref) => {
 });
 
 
-export default Markdown;
+export default SopMarkdown;
 
 
 // 工具整合
-const useSopTools = (files, tools) => {
+const useSopTools = (linsight) => {
+    const { files, tools, org_knowledge_enabled, personal_knowledge_enabled } = linsight
+
     const { data: linsightTools } = useGetLinsightToolList();
     const { data: personalTool } = useGetPersonalToolList();
     const { data: orgTools } = useGetOrgToolList();
@@ -147,34 +155,37 @@ const useSopTools = (files, tools) => {
     const valueToNameRef = useRef({});
     // 整合数据为二级树结构
     const buildTreeData = useMemo(() => {
-        const tree: { label: string; value: string; children: any[] }[] = [];
+        const tree: { label: string; value: string; desc: string; children: any[] }[] = [];
 
         // 1. 转换files数据
-        const fileNode = {
-            label: "上传文件",
-            value: "",
-            children: []
-        };
         if (files && files.length > 0) {
+            const fileNode = {
+                label: "上传文件",
+                value: "",
+                desc: '',
+                children: []
+            };
             fileNode.children = files.map(file => {
                 const name = file.file_name;
-                const value = `${file.file_name}的文件储存信息：{"文件储存在语义检索库中的id":"${file.file_id}","文件储存地址":"${file.markdown_file_path}"}`;
+                const value = `${file.file_name}的文件储存信息：{"文件储存在语义检索库中的id":"${file.file_id}","文件储存地址":"./${decodeURIComponent(file.markdown_filename)}"}`;
                 nameToValueRef.current[name] = value;
                 valueToNameRef.current[value] = name;
                 return {
                     label: file.file_name,
                     value: file.file_id,
+                    desc: '',
                     children: []
                 }
             });
+            tree.push(fileNode);
         }
-        tree.push(fileNode);
 
         // 2. 转换orgTools数据
-        if (orgTools && orgTools.length > 0) {
+        if (org_knowledge_enabled && orgTools && orgTools.length > 0) {
             tree.push({
                 label: "组织知识库",
                 value: "org_knowledge_base", // 使用特殊标识避免ID冲突
+                desc: '',
                 children: orgTools.map(tool => {
                     const name = tool.name;
                     const value = `${tool.name}的储存信息：{"知识库储存在语义检索库中的id":"${tool.id}"}`
@@ -183,6 +194,7 @@ const useSopTools = (files, tools) => {
                     return {
                         label: tool.name,
                         value: tool.id,
+                        desc: tool.description,
                         children: []
                     }
                 })
@@ -190,10 +202,11 @@ const useSopTools = (files, tools) => {
         }
 
         // 3. 转换PersonalTool数据（单对象转数组）
-        if (personalTool && personalTool[0]) {
+        if (personal_knowledge_enabled && personalTool && personalTool[0]) {
             tree.push({
                 label: personalTool[0].name,
                 value: personalTool[0].id,
+                desc: '',
                 children: [] // 个人知识库没有子节点
             });
             const name = personalTool[0].name;
@@ -208,14 +221,16 @@ const useSopTools = (files, tools) => {
                 tree.push({
                     label: toolGroup.name,
                     value: toolGroup.id,
+                    desc: toolGroup.description,
                     children: (toolGroup.children || []).map(child => {
                         const name = child.name;
-                        const value = `${child.id}`
+                        const value = `${child.tool_key}`
                         nameToValueRef.current[name] = value;
                         valueToNameRef.current[value] = name;
                         return {
                             label: child.name,
-                            value: child.id,
+                            value: child.tool_key,
+                            desc: child.desc,
                             children: [] // 二级节点无子节点
                         }
                     })
@@ -228,6 +243,7 @@ const useSopTools = (files, tools) => {
                 tree.push({
                     label: toolGroup.name,
                     value: toolGroup.id,
+                    desc: toolGroup.description,
                     children: (toolGroup.children || []).map(child => {
                         const name = child.name;
                         const value = `${child.tool_key}`
@@ -236,6 +252,7 @@ const useSopTools = (files, tools) => {
                         return {
                             label: child.name,
                             value: child.tool_key,
+                            desc: child.desc,
                             children: []
                         }
                     })
@@ -250,6 +267,27 @@ const useSopTools = (files, tools) => {
     return { nameToValueRef, valueToNameRef, buildTreeData };
 };
 
+// 滚动隐藏@标记
+const useAtTip = (scrollBoxRef) => {
+    useEffect(() => {
+
+        const handleScroll = () => {
+            const atDom = document.querySelector('#vditor-placeholder-at');
+            if (atDom) {
+                atDom.style.display = 'none';
+            }
+        }
+        if (scrollBoxRef.current) {
+            scrollBoxRef.current.addEventListener('scroll', handleScroll);
+        }
+
+        return () => {
+            if (scrollBoxRef.current) {
+                scrollBoxRef.current.removeEventListener('scroll', handleScroll);
+            }
+        }
+    }, [scrollBoxRef.current])
+}
 
 /**
  * 正向替换：将 @标记@ 替换为 {{value}} 格式
@@ -262,9 +300,10 @@ function replaceMarkersToBraces(inputStr, valueToNameMap) {
     return inputStr.replace(regex, (match, id) => {
         // 检查映射中是否存在该ID
         if (Object.prototype.hasOwnProperty.call(valueToNameMap, id)) {
-            return `{{${valueToNameMap[id]}}}`;
+            return `{{@${valueToNameMap[id]}@}}`;
         }
-        return `{{${id}}}`; // 未找到时保留原始ID
+        console.warn('转换ui时未找到对应的ID  :>> ', valueToNameMap, id);
+        return `{{#${id}#}}`; // 未找到时保留原始ID
     });
 }
 
@@ -281,6 +320,7 @@ function replaceBracesToMarkers(inputStr, nameToValueMap) {
         if (Object.prototype.hasOwnProperty.call(nameToValueMap, value)) {
             return `@${nameToValueMap[value]}@`;
         }
-        return `{{${value}}}`; // 未找到时保留原始值
+        console.warn('转换sop时未找到对应的工具  :>> ', nameToValueMap, value);
+        return `${value}`; // 未找到时保留原始值
     });
 }

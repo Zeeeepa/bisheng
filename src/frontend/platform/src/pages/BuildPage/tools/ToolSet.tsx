@@ -33,29 +33,30 @@ const ToolSet = forwardRef(function ToolSet({ onChange }, ref) {
     // });
     const idRef = useRef('');
     const [name, setName] = useState('');
- const { config: webSearchData, setConfig } = useWebSearchStore()
+    const { config: webSearchData, setConfig } = useWebSearchStore()
 
     useImperativeHandle(ref, () => ({
+
         edit: (item) => {
             setName(item.name);
             idRef.current = item.id;
-            const config = item.children[0]?.extra 
-                ? JSON.parse(item.children[0].extra)
-                : webSearchData || {};
-                
+            console.log(item, webSearchData, 222);
+            const config =
+                webSearchData || {};
+
             setFormData(config);
-            setOpen(true); 
+            setOpen(true);
         }
     }));
 
 
 
-  const handleSubmit = async (formdata) => {
-    await updateAssistantToolApi(idRef.current, formdata)
-    setConfig(formdata)
-    setOpen(false)
-    onChange()
-  }
+    const handleSubmit = async (formdata) => {
+        await updateAssistantToolApi(idRef.current, formdata)
+        setConfig(formdata)
+        setOpen(false)
+        onChange()
+    }
 
     // const getFieldsToSubmit = () => {
     //     const fields = {};

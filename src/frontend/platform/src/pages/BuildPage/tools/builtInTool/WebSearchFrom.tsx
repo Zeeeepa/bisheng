@@ -1,11 +1,13 @@
-import { Button } from '@/components/bs-ui/button';
-import { DialogClose, DialogFooter } from "@/components/bs-ui/dialog";
 import { useEffect, useState } from 'react';
 import { useTranslation } from "react-i18next";
-import { InputField, SelectField } from "./InputField";
+import { Button } from '@/components/bs-ui/button';
+import { DialogClose, DialogFooter } from "@/components/bs-ui/dialog";
 import { Label } from '@/components/bs-ui/label';
-import { useWebSearchStore } from '../webSearchStore'
-import { toast, useToast } from '@/components/bs-ui/toast/use-toast';
+import { toast } from '@/components/bs-ui/toast/use-toast';
+import { getAssistantToolsApi } from "@/controllers/API/assistant";
+import { useWebSearchStore } from '../webSearchStore';
+import { InputField, SelectField } from "./InputField";
+import { LoadingIcon } from '@/components/bs-icons/loading';
 
 const defaultToolParams = {
     bing: {
@@ -29,9 +31,51 @@ const defaultToolParams = {
 
 const WebSearchForm = ({ formData, onSubmit, errors = {} }) => {
     const { t } = useTranslation();
-    const { toast } = useToast();
     const { config: webSearchData, setConfig } = useWebSearchStore();
-        const validationRules = {
+    const [loading, setLoading] = useState(true);
+
+    const [allToolsConfig, setAllToolsConfig] = useState(() => {
+        const mergedConfig = {
+            ...defaultToolParams,
+            ...(webSearchData?.config || {}),
+            ...(formData?.config || {})
+        };
+        return mergedConfig;
+    });
+
+    const [selectedTool, setSelectedTool] = useState(webSearchData?.type || 'bing');
+    const [formErrors, setFormErrors] = useState({});
+
+    // 初始化时获取联网搜索配置
+    useEffect(() => {
+        const fetchWebSearchConfig = async () => {
+            try {
+                const res = await getAssistantToolsApi('default');
+                const webSearchTool = res.find(item => item.name === "联网搜索");
+
+                if (webSearchTool && webSearchTool.extra) {
+                    const extraData = JSON.parse(webSearchTool.extra);
+                    setSelectedTool(extraData.type || 'bing');
+                    setAllToolsConfig({
+                        ...defaultToolParams,
+                        ...extraData.config
+                    });
+                }
+            } catch (error) {
+                toast({
+                    title: "获取配置失败",
+                    description: error.message,
+                    variant: "error",
+                });
+            } finally {
+                setLoading(false);
+            }
+        };
+
+        fetchWebSearchConfig();
+    }, []);
+
+    const validationRules = {
         bing: {
             api_key: (value) => !value && 'Bing Subscription Key 不能为空',
             base_url: (value) => !value && 'Bing Search URL 不能为空'
@@ -44,63 +88,39 @@ const WebSearchForm = ({ formData, onSubmit, errors = {} }) => {
         },
         serp: {
             api_key: (value) => !value && 'API Key 不能为空',
-            engine: (value) => !value && 'Search Engine 不能为空'
+            engine: (value) => !value && 'engine 不能为空'
         },
         tavily: {
             api_key: (value) => !value && 'API Key 不能为空'
         }
-        };
-    const [allToolsConfig, setAllToolsConfig] = useState(() => {
-        return webSearchData?.config || {
-            bing: defaultToolParams.bing,
-            bocha: defaultToolParams.bocha,
-            jina: defaultToolParams.jina,
-            serp: defaultToolParams.serp,
-            tavily: defaultToolParams.tavily
-        };
-    });
+    };
 
-    const [selectedTool, setSelectedTool] = useState(webSearchData?.type || 'bing');
-    const [formErrors, setFormErrors] = useState({});
+    const handleToolChange = (tool) => {
+        setSelectedTool(tool);
+        setFormErrors({});
+    };
 
- const handleToolChange = (tool) => {
-    setSelectedTool(tool);
-    setFormErrors({});
-};
-    useEffect(() => {
-        if (webSearchData) {
-            setAllToolsConfig(webSearchData.config || {
-                bing: defaultToolParams.bing,
-                bocha: defaultToolParams.bocha,
-                jina: defaultToolParams.jina,
-                serp: defaultToolParams.serp,
-                tavily: defaultToolParams.tavily
-            });
-            setSelectedTool(webSearchData.type || 'bing');
-        }
-    }, [webSearchData]);
-const handleParamChange = (e) => {
-    const { name, value } = e.target;
-    setAllToolsConfig(prev => ({
-        ...prev,
-        [selectedTool]: {
-            ...prev[selectedTool],
-            [name]: value
-        }
-    }));
-    
-    // 清除当前字段的错误
-    setFormErrors(prev => ({
-        ...prev,
-        [name]: undefined
-    }));
-};
+    const handleParamChange = (e) => {
+        const { name, value } = e.target;
+        setAllToolsConfig(prev => ({
+            ...prev,
+            [selectedTool]: {
+                ...prev[selectedTool],
+                [name]: value
+            }
+        }));
 
-     const handleSubmit = (e) => {
+        setFormErrors(prev => ({
+            ...prev,
+            [name]: undefined
+        }));
+    };
+
+    const handleSubmit = (e) => {
         e.preventDefault();
         const errors = {};
         const currentToolRules = validationRules[selectedTool];
-        
+
         Object.keys(currentToolRules).forEach(key => {
             const error = currentToolRules[key](allToolsConfig[selectedTool][key]);
             if (error) {
@@ -115,18 +135,12 @@ const handleParamChange = (e) => {
 
         const newConfig = {
             type: selectedTool,
-            config: {
-            bing: allToolsConfig.bing,
-            bocha: allToolsConfig.bocha,
-            jina: allToolsConfig.jina,
-            serp: allToolsConfig.serp,
-            tavily: allToolsConfig.tavily
-        }
+            config: allToolsConfig
         };
         try {
             setConfig(newConfig);
             console.log('提交的数据:', newConfig);
-console.log("webSearchData 是否更新?", webSearchData);
+            console.log("webSearchData 是否更新?", webSearchData);
             toast({
                 title: "保存成功",
                 variant: "success",
@@ -142,9 +156,11 @@ console.log("webSearchData 是否更新?", webSearchData);
     };
 
     const renderParams = () => {
+        if (loading) return <LoadingIcon />;
+
         const currentTool = allToolsConfig[selectedTool];
-        console.log(currentTool,111);
-        
+        console.log(currentTool, 111);
+
         if (!currentTool) return null;
 
         switch (selectedTool) {
@@ -156,7 +172,7 @@ console.log("webSearchData 是否更新?", webSearchData);
                             label="Bing Subscription Key"
                             type="password"
                             name="api_key"
-                            value={currentTool?.api_key || ''}
+                            value={currentTool.api_key || ''}
                             onChange={handleParamChange}
                             error={formErrors.api_key}
                             id="bing-api-key"
@@ -165,7 +181,7 @@ console.log("webSearchData 是否更新?", webSearchData);
                             required
                             label="Bing Search URL"
                             name="base_url"
-                            value={currentTool?.base_url || defaultToolParams.bing.base_url}
+                            value={currentTool.base_url || defaultToolParams.bing.base_url}
                             onChange={handleParamChange}
                             error={formErrors.base_url}
                             id="bing-base-url"
@@ -179,7 +195,7 @@ console.log("webSearchData 是否更新?", webSearchData);
                         label="API Key"
                         type="password"
                         name="api_key"
-                        value={currentTool?.api_key || ''}
+                        value={currentTool.api_key || ''}
                         onChange={handleParamChange}
                         error={formErrors.api_key}
                         id="bocha-api-key"
@@ -192,7 +208,7 @@ console.log("webSearchData 是否更新?", webSearchData);
                         label="API Key"
                         type="password"
                         name="api_key"
-                        value={currentTool?.api_key || ''}
+                        value={currentTool.api_key || ''}
                         onChange={handleParamChange}
                         error={formErrors.api_key}
                         id="jina-api-key"
@@ -206,16 +222,16 @@ console.log("webSearchData 是否更新?", webSearchData);
                             label="API Key"
                             type="password"
                             name="api_key"
-                            value={currentTool?.api_key || ''}
+                            value={currentTool.api_key || ''}
                             onChange={handleParamChange}
                             error={formErrors.api_key}
                             id="serp-api-key"
                         />
                         <InputField
                             required
-                            label="Search Engine"
+                            label="engine"
                             name="engine"
-                            value={currentTool?.engine || 'baidu'}
+                            value={currentTool.engine || 'baidu'}
                             onChange={handleParamChange}
                             error={formErrors.engine}
                             id="serp-engine"
@@ -229,13 +245,14 @@ console.log("webSearchData 是否更新?", webSearchData);
                         label="API Key"
                         type="password"
                         name="api_key"
-                        value={currentTool?.api_key || ''}
+                        value={currentTool.api_key || ''}
                         onChange={handleParamChange}
                         error={formErrors.api_key}
                         id="tavily-api-key"
                     />
                 );
-             return null;
+            default:
+                return null;
         }
     };
 
@@ -267,7 +284,7 @@ console.log("webSearchData 是否更新?", webSearchData);
                         {t('build.cancel')}
                     </Button>
                 </DialogClose>
-                <Button className="px-11" type="submit">
+                <Button className="px-11" type="submit" disabled={loading}>
                     {t('build.confirm')}
                 </Button>
             </DialogFooter>

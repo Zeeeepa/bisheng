@@ -5,8 +5,8 @@ import { SendIcon } from '~/components/svg';
 import { playDing } from '~/utils';
 import Markdown from '../Chat/Messages/Content/Markdown';
 import { Button, Textarea } from '../ui';
-import { SopStatus } from './SOPEditor';
 import FileIcon from '../ui/icon/File';
+import { SopStatus } from './SOPEditor';
 
 const Task = ({ task, lvl1 = false, que, sendInput, children = null }) => {
     const [isHistoryExpanded, setIsHistoryExpanded] = useState(false);
@@ -14,7 +14,8 @@ const Task = ({ task, lvl1 = false, que, sendInput, children = null }) => {
 
     // 根据状态选择对应的图标
     const renderStatusIcon = () => {
-        switch (task.status) {
+        const status = (task.children?.some(child => child.status === 'user_input') && 'user_input') || task.status;
+        switch (status) {
             // case "not_started":
             case "terminated":
             case "user_input":
@@ -69,13 +70,13 @@ const Task = ({ task, lvl1 = false, que, sendInput, children = null }) => {
                     startMap.delete(msg.call_id);
                 }
                 // 总是添加 end 消息
-                result.push(msg.call_reason);
+                msg.call_reason && result.push(msg.call_reason);
             }
         }
 
         // 添加所有未匹配的 start 消息
         for (const startMsg of startMap.values()) {
-            result.push(startMsg.call_reason);
+            startMsg.call_reason && result.push(startMsg.call_reason);
         }
 
         return result;
@@ -204,7 +205,11 @@ export const TaskFlowContent = ({ tasks, status, summary, files, sendInput }) =>
                     {/* <p className='text-sm text-gray-500'></p> */}
                     <div className='mt-5 flex flex-wrap gap-3'>
                         {files?.map((file) => (
-                            <div key={file.file_id} className='w-[calc(50%-6px)] p-2 rounded-2xl border border-[#ebeef2]'>
+                            <div
+                                key={file.file_id}
+                                onClick={() => downloadFile(file)}
+                                className='w-[calc(50%-6px)] p-2 rounded-2xl border border-[#ebeef2] cursor-pointer'
+                            >
                                 <div className='bg-[#F4F6FB] h-24 p-4 rounded-lg overflow-hidden'>
                                     <FileIcon type={file.file_name.split('.').pop().toLowerCase()} className='size-24 mx-auto opacity-20' />
                                 </div>

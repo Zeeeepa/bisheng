@@ -61,7 +61,10 @@ export const TaskFlow = ({ versionId, setVersions, setVersionId }) => {
                 status: SopStatus.NotStarted
             })
 
-            setVersions((prve) => [{ id: newVersionId, name: res.data.version.replace('T', ' ') }, ...prve])
+            setVersions((prve) => [{
+                id: newVersionId,
+                name: res.data.version.replace('T', ' ').replaceAll('-', '/').slice(0, -3)
+            }, ...prve])
             setVersionId(newVersionId)
             // 切换版本
             check && !cancel && setLinsightSubmission(newVersionId, {
@@ -110,6 +113,7 @@ export const TaskFlow = ({ versionId, setVersions, setVersionId }) => {
                 )}
                 {
                     showTask && <TaskFlowContent
+                        key={versionId}
                         status={linsight.status}
                         tasks={linsight.tasks}
                         summary={linsight?.summary}
@@ -120,9 +124,11 @@ export const TaskFlow = ({ versionId, setVersions, setVersionId }) => {
             </div>
 
             <TaskControls
+                key={versionId}
                 current={currentTask}
                 tasks={linsight.tasks}
                 status={linsight.status}
+                feedbackProvided={!!linsight.execute_feedback}
                 onStop={stop}
                 onFeedback={handleFeedback}
             />

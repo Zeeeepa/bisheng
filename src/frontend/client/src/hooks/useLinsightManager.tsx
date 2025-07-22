@@ -11,6 +11,7 @@ import { SSE } from 'sse.js';
 import { SopStatus } from '~/components/Sop/SOPEditor';
 import { ConversationData, QueryKeys } from '~/data-provider/data-provider/src';
 import { useToastContext } from '~/Providers';
+import store from '~/store';
 import { activeSessionIdState, LinsightInfo, linsightMapState, submissionState, SubmissionState } from '~/store/linsight';
 import {
     addConversation,
@@ -169,6 +170,8 @@ export const useGenerateSop = (versionId, setVersionId, setVersions) => {
     const { createLinsight, updateLinsight } = useLinsightManager()
     const queryClient = useQueryClient();
     const { showToast } = useToastContext();
+    const [error, setError] = useState(false);
+    const { setConversation } = store.useCreateConversationAtom(0);
 
     const mockGenerateSop = (versionId: string, feedback?: string) => {
         console.log('Mock SSE started for version:', versionId, linsightSubmission);
@@ -239,9 +242,6 @@ export const useGenerateSop = (versionId, setVersionId, setVersions) => {
         sse.addEventListener('open', () => {
             console.log('connection is opened');
             setLoading(false)
-            updateLinsight(_versionId, {
-                status: SopStatus.SopGenerating,
-            })
         });
 
         sse.addEventListener('error', async (e: MessageEvent) => {
@@ -250,9 +250,10 @@ export const useGenerateSop = (versionId, setVersionId, setVersions) => {
                 message: 'SOP 生成失败，请联系管理员检查灵思任务执行模型状态',
                 status: 'error',
             });
+            setError(true)
             setLoading(false)
-            updateLinsight(_versionId, {
-                status: SopStatus.SopGenerating,
+            updateLinsight(versionId, {
+                status: SopStatus.SopGenerated,
             })
         })
         sse.stream();
@@ -293,7 +294,7 @@ export const useGenerateSop = (versionId, setVersionId, setVersions) => {
                     setVersionId(versionId)
                     setVersions((prevVersions) => [{
                         id: versionId,
-                        name: linsight_session_version.version.replace('T', ' ')
+                        name: linsight_session_version.version.replace('T', ' ').replaceAll('-', '/').slice(0, -3)
                     }, ...prevVersions])
 
                     // replaceUrl
@@ -305,8 +306,8 @@ export const useGenerateSop = (versionId, setVersionId, setVersions) => {
                         files: linsight_session_version.files?.map(file => ({ ...file, file_name: decodeURIComponent(file.original_filename) })) || [],
                         user_id: linsight_session_version.user_id,
                         question: linsightSubmission.question,
-                        org_knowledge_enabled: false,
-                        personal_knowledge_enabled: false,
+                        org_knowledge_enabled,
+                        personal_knowledge_enabled,
                         sop: '',
                         execute_feedback: null,
                         version: versionId,
@@ -332,6 +333,12 @@ export const useGenerateSop = (versionId, setVersionId, setVersions) => {
                         }
                         updateLinsight(versionId, {
                             title: data.task_title
+                        })
+                        setConversation((prevState: any) => {
+                            return {
+                                ...prevState,
+                                conversationId: data.chat_id
+                            }
                         })
                         return addConversation(convoData, {
                             conversationId: data.chat_id,
@@ -359,9 +366,10 @@ export const useGenerateSop = (versionId, setVersionId, setVersions) => {
                         message: 'SOP 生成失败，请联系管理员检查灵思任务执行模型状态',
                         status: 'error',
                     });
+                    setError(true)
                     setLoading(false)
                     updateLinsight(versionId, {
-                        status: SopStatus.SopGenerating,
+                        status: SopStatus.SopGenerated,
                     })
                 })
                 sse.stream();
@@ -369,11 +377,15 @@ export const useGenerateSop = (versionId, setVersionId, setVersions) => {
                 generateSop(versionId, linsightSubmission.feedback)
             }
 
+            updateLinsight(versionId, {
+                status: SopStatus.SopGenerating,
+            })
             clearLinsightSubmission(versionId)
+            setError(false)
         }
     }, [linsightSubmission])
 
-    return loading
+    return [loading, error]
 }
 
 
@@ -400,7 +412,8 @@ const convertTools = (tools) => {
                     return {
                         id: api.id,
                         name: api.name,
-                        tool_key: api.tool_key
+                        tool_key: api.tool_key,
+                        desc: api.desc
                     }
                 })
             })
@@ -419,16 +432,16 @@ function buildTaskTree(tasks) {
     const newTasks = tasks.map(task => {
         return {
             id: task.id,
-            name: task.task_data?.target || '',
-            status: task.status,
+            name: task.task_data?.display_target || '',
+            status: task.status === 'waiting_for_user_input' ? 'user_input' : task.status,
             history: task.history || [],
             event_type: task.status === 'waiting_for_user_input' ? 'user_input' : '',
-            call_reason: '',
+            call_reason: task.input_prompt || '',
             children: task.children?.map(child => {
                 return {
                     id: child.id,
-                    name: child.task_data?.target || '',
-                    status: child.status,
+                    name: child.task_data?.display_target || '',
+                    status: child.status === 'waiting_for_user_input' ? 'user_input' : child.status,
                     history: child.history || [],
                     event_type: child.status === 'waiting_for_user_input' ? 'user_input' : '',
                     call_reason: ''

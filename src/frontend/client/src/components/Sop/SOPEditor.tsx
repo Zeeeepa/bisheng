@@ -1,11 +1,10 @@
 import { AnimatePresence, motion } from 'framer-motion';
 import { PencilLineIcon } from 'lucide-react';
-import { useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { saveSop, startLinsight } from '~/api/linsight';
 import { useLinsightManager, useLinsightSessionManager } from '~/hooks/useLinsightManager';
 import { Button, Textarea } from '../ui';
-import Markdown from './Markdown';
-import { saveSop, startLinsight } from '~/api/linsight';
-
+import SopMarkdown from './SopMarkdown';
 
 export const enum SopStatus {
     /* 未开始 */
@@ -66,7 +65,7 @@ const SOPEditorArea = ({ setOpenAreaText, onsubmit }) => {
     </div>
 }
 
-export const SOPEditor = ({ versionId, setIsLoading }) => {
+export const SOPEditor = ({ versionId, sopError }) => {
     const [openAreaText, setOpenAreaText] = useState(false)
     const { getLinsight, updateLinsight } = useLinsightManager()
     const markdownRef = useRef(null)
@@ -113,6 +112,39 @@ export const SOPEditor = ({ versionId, setIsLoading }) => {
 
     const showSopEdit = [SopStatus.Running, SopStatus.completed, SopStatus.FeedbackCompleted, SopStatus.Stoped].includes(linsight.status)
 
+    // auto save
+    const sopValueFuncRef = useRef<null | ((id) => void)>(null)
+    const [disabled, setDisabled] = useStartDisable(linsight.status, linsight.sop)
+    const handleChange = (val) => {
+        sopValueFuncRef.current = (_v) => {
+            saveSop({
+                sop_content: val,
+                linsight_session_version_id: _v
+            }).then(res => {
+                if (res.status_code === 200) {
+                    updateLinsight(_v, { sop: val, inputSop: true })
+                }
+            }).catch(err => {
+                console.error('err :>> ', err);
+            })
+        }
+
+        setDisabled(val.trim() === '')
+    }
+    useEffect(() => {
+        const timer = setInterval(() => {
+            if (sopValueFuncRef.current) {
+                sopValueFuncRef.current(versionId)
+                sopValueFuncRef.current = null
+            }
+        }, 2000);
+
+        return () => {
+            clearInterval(timer)
+            sopValueFuncRef.current?.(versionId)
+            sopValueFuncRef.current = null
+        }
+    }, [versionId])
 
     return (
         <motion.div
@@ -127,7 +159,7 @@ export const SOPEditor = ({ versionId, setIsLoading }) => {
             </div>
 
             <div className='p-8 linsight-markdown flex-1 min-h-0'>
-                <Markdown ref={markdownRef} value={linsight.sop} files={linsight.files} tools={linsight.tools} edit={showSopEdit} />
+                <SopMarkdown ref={markdownRef} linsight={linsight} edit={showSopEdit} onChange={handleChange} />
             </div>
 
             {linsight.status === SopStatus.SopGenerated && (
@@ -150,7 +182,7 @@ export const SOPEditor = ({ versionId, setIsLoading }) => {
                                     }}>
                                         重新生成 SOP
                                     </Button>
-                                    <Button className="px-6" onClick={handleRun}>
+                                    <Button className="px-6" disabled={sopError || disabled} onClick={handleRun}>
                                         开始执行
                                     </Button>
                                 </div>
@@ -165,3 +197,19 @@ export const SOPEditor = ({ versionId, setIsLoading }) => {
     );
 };
 
+
+const useStartDisable = (status: SopStatus, sop: string) => {
+    const [disabled, setDisabled] = useState(false)
+    const _sop = sop.trim()
+    useEffect(() => {
+        if (status === SopStatus.SopGenerating) {
+            setDisabled(false)
+        }
+    }, [status])
+
+    useEffect(() => {
+        setDisabled(_sop === '')
+    }, [sop])
+
+    return [disabled, setDisabled]
+}
