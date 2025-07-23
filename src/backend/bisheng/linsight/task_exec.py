@@ -2,13 +2,13 @@ import asyncio
 import json
 import os
 import shutil
-import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Optional, List, Dict, Callable
 
 from loguru import logger
 
+from bisheng.api.services.invite_code.invite_code import InviteCodeService
 from bisheng.api.services.linsight.sop_manage import SOPManageService
 from bisheng.api.services.linsight.workbench_impl import LinsightWorkbenchImpl
 from bisheng.api.services.llm import LLMService
@@ -26,7 +26,6 @@ from bisheng.interface.llms.custom import BishengLLM
 from bisheng.linsight.state_message_manager import LinsightStateMessageManager, MessageData, MessageEventType
 from bisheng.linsight import utils as linsight_execute_utils
 from bisheng.settings import settings
-from bisheng.utils import util
 from bisheng.utils.minio_client import minio_client
 from bisheng_langchain.linsight.agent import LinsightAgent
 from bisheng_langchain.linsight.const import TaskStatus
@@ -623,6 +622,11 @@ class LinsightWorkflowTask:
         await self._state_manager.push_message(
             MessageData(event_type=MessageEventType.ERROR_MESSAGE, data={"error": error_msg})
         )
+        system_config = await settings.aget_all_config()
+        # 获取Linsight_invitation_code
+        linsight_invitation_code = system_config.get("linsight_invitation_code", False)
+        if linsight_invitation_code:
+            await InviteCodeService.revoke_invite_code(user_id=session_model.user_id)
 
     async def _handle_execution_error(self, session_version_id: str, error: Exception):
         """处理执行错误"""
