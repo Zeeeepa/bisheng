@@ -13,7 +13,7 @@ import Preview from "./Preview";
 import { useAssistantStore } from "@/store/assistantStore";
 import { Search, Star, X } from "lucide-react";
 import { t } from "i18next";
-import { sopApi } from "@/controllers/API/linsight";
+import { sopApi} from "@/controllers/API/linsight";
 import { getAssistantToolsApi } from "@/controllers/API/assistant";
 import ToolSelector from "@/components/LinSight/ToolSelector";
 import SopFormDrawer from "@/components/LinSight/SopFormDrawer";
@@ -21,6 +21,7 @@ import SopTable from "@/components/LinSight/SopTable";
 import { bsConfirm } from "@/components/bs-ui/alertDialog/useConfirm";
 import { LoadIcon, LoadingIcon } from "@/components/bs-icons/loading";
 import { cloneDeep } from "lodash-es";
+import ImportFromRecordsDialog from "@/components/LinSight/SopFromRecord";
 
 
 export interface FormErrors {
@@ -100,6 +101,7 @@ export default function index({ formData: parentFormData, setFormData: parentSet
     const [activeToolTab, setActiveToolTab] = useState<'builtin' | 'api' | 'mcp'>('mcp');
     const [manuallyExpandedItems, setManuallyExpandedItems] = useState<string[]>([]);
     const [initialized, setInitialized] = useState(false);
+    // const [importDialogOpen, setImportDialogOpen] = useState(false);
     const [deleteConfirmModal, setDeleteConfirmModal] = useState({
         open: false,
         title: '确认删除',
@@ -489,41 +491,56 @@ export default function index({ formData: parentFormData, setFormData: parentSet
 
         fetchData(requestParams);
     };
-    const handleBatchDelete = async () => {
-        setBatchDeleting(true);
-        try {
-            await sopApi.batchDeleteSop(selectedItems);
+ const handleBatchDelete = async () => {
+    setBatchDeleting(true);
+    try {
+        await sopApi.batchDeleteSop(selectedItems);
 
-            const newTotal = total - selectedItems.length;
-            const newTotalPages = Math.ceil(newTotal / pageSize);
-            let newPage = page;
-
-            if (datalist.length === selectedItems.length) {
-                if (page > 1) {
-                    newPage = page - 1;
-                } else if (newTotal > 0) {
-                    newPage = 1;
-                }
+        // 计算新的总数
+        const newTotal = total - selectedItems.length;
+        const newTotalPages = Math.ceil(newTotal / pageSize);
+        
+        // 确定新的当前页
+        let newPage = page;
+        
+        if (datalist.length === selectedItems.length) {
+            if (page > 1) {
+                newPage = page - 1;
+            } 
+            else if (newTotal > 0) {
+                newPage = 1;
             }
-
-            setTotal(newTotal);
-            setSelectedItems([]);
-            setPageInputValue(newPage.toString());
-
-            // 确保传递所有必要参数
-            fetchData({
-                page: newPage,
-                pageSize: pageSize,
-                keyword: keywords,
-            });
-
-            toast({ variant: 'success', description: `成功删除 ${selectedItems.length} 个 SOP` });
-        } catch (error) {
-            toast({ variant: 'error', description: '删除失败，请稍后重试' });
-        } finally {
-            setBatchDeleting(false);
         }
-    };
+        if (newPage > newTotalPages && newTotalPages > 0) {
+            newPage = newTotalPages;
+        }
+
+        // 更新状态
+        setTotal(newTotal);
+        setSelectedItems([]);
+        setPage(newPage);  // 确保更新page状态
+        setPageInputValue(newPage.toString());
+
+        // 重新获取数据
+        fetchData({
+            page: newPage,
+            pageSize: pageSize,
+            keyword: keywords,
+        });
+
+        toast({ 
+            variant: 'success', 
+            description: `成功删除 ${selectedItems.length} 个 SOP` 
+        });
+    } catch (error) {
+        toast({ 
+            variant: 'error', 
+            description: '删除失败，请稍后重试' 
+        });
+    } finally {
+        setBatchDeleting(false);
+    }
+};
     const handleSelectAll = useCallback(() => {
         const currentPageIds = datalist.map(item => item.id);
         if (currentPageIds.every(id => selectedItems.includes(id))) {
@@ -717,6 +734,8 @@ export default function index({ formData: parentFormData, setFormData: parentSet
 
                         <div className="mb-6">
                             <p className="text-lg font-bold mb-2">灵思SOP管理</p>
+                            {/* <p className="text-lg font-bold mb-2">灵思SOP库</p> */}
+
                             <div className="flex items-center gap-2 mb-2">
                                 <div className="relative flex-1 max-w-xs">
                                     <div className="relative">
@@ -744,18 +763,7 @@ export default function index({ formData: parentFormData, setFormData: parentSet
                                     {/* <Button
                                         variant="default"
                                         size="sm"
-                                        onClick={() => {
-                                            setIsEditing(false);
-                                            setCurrentSopId(null);
-                                            setSopForm({
-                                                id: '',
-                                                name: '',
-                                                description: '',
-                                                content: '',
-                                                rating: 0
-                                            });
-                                            setIsDrawerOpen(true);
-                                        }}
+                                       onClick={() => setImportDialogOpen(true)}
                                     >
                                         从运行记录中导入
                                     </Button> */}
@@ -803,6 +811,10 @@ export default function index({ formData: parentFormData, setFormData: parentSet
                                     </Button>
                                 </div>
                             </div>
+                            {/* <ImportFromRecordsDialog 
+                                open={importDialogOpen} 
+                                onOpenChange={setImportDialogOpen} 
+                                /> */}
                             {/* 表格区域 */}
                             <SopTable datalist={datalist} selectedItems={selectedItems} handleSelectItem={handleSelectItem} handleSelectAll={handleSelectAll} handleSort={handleSort} handleEdit={handleEdit} handleDelete={handleDelete} page={page} pageSize={pageSize} total={total} loading={loading} pageInputValue={pageInputValue} handlePageChange={handlePageChange} handlePageInputChange={handlePageInputChange} handlePageInputConfirm={handlePageInputConfirm} handleKeyDown={handleKeyDown} />
                             {deleteConfirmModal.open && (
@@ -870,71 +882,43 @@ const useChatConfig = (
 ) => {
     const { toast } = useToast();
 
-    const handleSave = async (formData: ChatConfigForm) => {
-        const currentTools = Array.isArray(toolsData[activeToolTab])
-            ? toolsData[activeToolTab]
-            : [];
-        const processedTools = selectedTools.map(tool => {
-            const processedTool = {
-                ...tool,
-                extra: undefined
-            };
+const handleSave = async (formData: ChatConfigForm) => {
+  // 保留所有必要的字段
+  console.log(formData, 'formData',selectedTools,22);
+  
+  const processedTools = selectedTools.map(tool => ({
+    id: tool.id,
+    name: tool.name,
+    is_preset: tool.is_preset,
+    tool_key: tool.tool_key,
+    children: tool.children?.map(child => ({
+      id: child.id,
+      name: child.name,
+      tool_key: child.tool_key,
+      desc: child.desc 
+    }))
+  }));
 
-            if (tool.children) {
-                processedTool.children = tool.children.map(child => ({
-                    ...child,
-                    extra: undefined
-                }));
-            }
-            return processedTool;
-        });
-        const dataToSave = {
-            ...formData,
-            sidebarSlogan: formData.sidebarSlogan?.trim() || '',
-            welcomeMessage: formData.welcomeMessage?.trim() || '',
-            functionDescription: formData.functionDescription?.trim() || '',
-            inputPlaceholder: formData.inputPlaceholder,
-            maxTokens: formData.maxTokens || 15000,
-            linsightConfig: {
-                ...formData.linsightConfig,
-                input_placeholder: formData.linsightConfig?.input_placeholder || '',
-                tools: processedTools.reduce((acc, tool) => {
-                    const parentTool = currentTools.find(parent =>
-                        parent?.children?.some(child => child.id === tool.id)
-                    );
+  const dataToSave = {
+    ...formData,
+    linsightConfig: {
+      input_placeholder: formData.linsightConfig?.input_placeholder || '',
+      tools: processedTools
+    }
+  };
 
-                    if (parentTool) {
-                        const existingGroup = acc.find(g => g.id === parentTool.id);
-                        if (existingGroup) {
-                            existingGroup.children.push(tool);
-                        } else {
-                            acc.push({
-                                id: parentTool.id,
-                                name: parentTool.name,
-                                children: [tool]
-                            });
-                        }
-                    } else {
-                        acc.push(tool);
-                    }
-                    return acc;
-                }, [])
-            }
-        };
-
-        try {
-            const res = await setWorkstationConfigApi(dataToSave);
-            if (res) {
-                // 保存成功后更新本地状态
-                setFormData(dataToSave);
-                toast({ variant: 'success', description: '配置保存成功' });
-                return true;
-            }
-        } catch (error) {
-            toast({ variant: 'error', description: '保存失败' });
-            return false;
-        }
-    };
+  try {
+    const res = await setWorkstationConfigApi(dataToSave);
+    if (res) {
+      setFormData(dataToSave);
+      toast({ variant: 'success', description: '配置保存成功' });
+      return true;
+    }
+  } catch (error) {
+    toast({ variant: 'error', description: '保存失败' });
+    return false;
+  }
+};
 
     return { handleSave };
 };
