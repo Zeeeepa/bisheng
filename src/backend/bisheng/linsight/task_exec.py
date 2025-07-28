@@ -181,7 +181,7 @@ class LinsightWorkflowTask:
             workbench_conf = await LLMService.get_workbench_llm()
             return BishengLLM(model_id=workbench_conf.task_model.id, temperature=0)
         except Exception as e:
-            raise TaskExecutionError(f"LLM初始化失败: {e}")
+            raise TaskExecutionError("任务已终止，请联系管理员检查灵思任务执行模型状态")
 
     @create_cache_folder_async
     async def _init_file_directory(self, session_model: LinsightSessionVersion) -> str:
@@ -584,8 +584,8 @@ class LinsightWorkflowTask:
                 )
             )
 
-            # 保存SOP
-            await self._save_sop(session_model, llm)
+            # TODO: 保存SOP 暂时关闭自动保存SOP功能
+            # await self._save_sop(session_model, llm)
 
             logger.info(f"任务成功完成，处理了 {len(final_result_files)} 个文件")
 
