@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import datetime
 import json
 import time
@@ -157,7 +158,8 @@ class BaseTask(BaseModel):
             await self.put_event(GenerateSubTask(task_id=self.id,
                                                  subtask=[one.get_task_info() for one in self.children]))
         if not self.children:
-            raise ValueError("No sub-tasks generated for the loop task.")
+            self.status = TaskStatus.SUCCESS.value
+            return None
         # 如果是循环任务，子任务执行完毕后需要将结果合并。目前
         all_failed = True
         answer = []
@@ -261,7 +263,7 @@ class BaseTask(BaseModel):
         raise NotImplementedError
 
     async def get_answer(self) -> str:
-        if not self.answer:
+        if not self.history:
             return ""
 
         if self.summarize_answer:
@@ -408,7 +410,7 @@ class Task(BaseTask):
                                                   name=tool_name,
                                                   params=tool_args,
                                                   status="start"))
-                    tool_result, _ = await self.task_manager.ainvoke_tool(tool_name, tool_args)
+                    tool_result, _ = await self.task_manager.ainvoke_tool(tool_name, copy.deepcopy(tool_args))
                     await self.put_event(ExecStep(task_id=self.id,
                                                   call_id=one.get('id'),
                                                   call_reason=call_reason,
