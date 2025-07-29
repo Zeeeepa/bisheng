@@ -12,8 +12,8 @@ COPY . /app
 
 # 使用 pnpm 安装依赖并构建
 RUN cd /app/platform && \
-    pnpm install --force --registry=https://registry.npmmirror.com && \
-    pnpm run build
+    pnpm install && \
+    pnpm build
 RUN cd /app/client && npm install --force --registry=https://registry.npmmirror.com && npm run build
 
 FROM nginx
