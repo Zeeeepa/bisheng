@@ -35,6 +35,7 @@ from bisheng.utils import util
 from bisheng.utils.embedding import decide_embeddings
 from bisheng.utils.minio_client import minio_client
 from bisheng.utils.util import calculate_md5
+from bisheng_langchain.linsight.const import ExecConfig
 
 
 @dataclass
@@ -337,6 +338,9 @@ class LinsightWorkbenchImpl:
             # 创建代理并生成SOP
             agent = await cls._create_linsight_agent(session_version, llm, tools, workbench_conf)
 
+            if previous_session_version_id:
+                session_version = await LinsightSessionVersionDao.get_by_id(previous_session_version_id)
+
             content = ""
             async for res in cls._generate_sop_content(
                     agent, session_version, feedback_content, history_summary
@@ -442,15 +446,15 @@ class LinsightWorkbenchImpl:
         from bisheng_langchain.linsight.agent import LinsightAgent
 
         root_path = os.path.join(CACHE_DIR, "linsight", session_version.id[:8])
-
+        linsight_conf = settings.get_linsight_conf()
+        exec_config = ExecConfig(**linsight_conf.model_dump(), debug_id=session_version.id)
         return LinsightAgent(
             file_dir=root_path,
             query=session_version.question,
             llm=llm,
             tools=tools,
             task_mode=workbench_conf.linsight_executor_mode,
-            debug=settings.linsight_conf.debug,
-            debug_id=session_version.id
+            exec_config=exec_config,
         )
 
     @classmethod
@@ -478,6 +482,7 @@ class LinsightWorkbenchImpl:
             async for res in agent.generate_sop(sop=sop_template, file_list=file_list):
                 yield res
         else:
+
             sop_template = session_version.sop if session_version.sop else ""
             if sop_template:
                 sop_template = f"例子:\n\n{sop_template}"
