@@ -8,6 +8,7 @@ import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/bs-ui
 import AutoPagination from '../bs-ui/pagination/autoPagination';
 import { LoadIcon } from '../bs-icons/loading';
 import { sopApi } from "@/controllers/API/linsight";
+import { captureAndAlertRequestErrorHoc } from '@/controllers/request';
 
 interface SopRecord {
   id: number;
@@ -39,6 +40,7 @@ export default function ImportFromRecordsDialog({ open, onOpenChange }) {
   const [duplicateDialogOpen, setDuplicateDialogOpen] = useState(false);
   const [duplicateNames, setDuplicateNames] = useState<string[]>([]);
   const [pageInputValue, setPageInputValue] = useState(page.toString());
+  const [selectedRecordIds, setSelectedRecordIds] = useState<number[]>([]);
 // 获取SOP记录
 const fetchRecords = async () => {
   setLoading(true);
@@ -148,46 +150,62 @@ const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
 };
   // 处理记录选择和多选
   const handleSelectRecord = (record: SopRecord) => setCurrentRecord(record);
-  const handleToggleSelect = (record: SopRecord, e: React.MouseEvent) => {
-    e.stopPropagation();
-    setSelectedRecords(prev => 
-      prev.some(r => r.id === record.id)
-        ? prev.filter(r => r.id !== record.id)
-        : [...prev, record]
-    );
-    setCurrentRecord(record);
-  };
-
-  // 导入SOP
- const importSops = async (recordsToImport: SopRecord[], overwrite = false) => {
+const handleToggleSelect = (record: SopRecord, e: React.MouseEvent) => {
+  e.stopPropagation();
+  setSelectedRecordIds(prev => 
+    prev.includes(record.id)
+      ? prev.filter(id => id !== record.id)
+      : [...prev, record.id]
+  );
+  setCurrentRecord(record);
+};
+// 全选/取消全选当前页
+const handleToggleSelectAll = () => {
+  const currentPageIds = records.map(r => r.id);
+  const allSelected = currentPageIds.every(id => selectedRecordIds.includes(id));
+  
+  if (allSelected) {
+    setSelectedRecordIds(prev => prev.filter(id => !currentPageIds.includes(id)));
+  } else {
+    const newSelected = [...selectedRecordIds];
+    currentPageIds.forEach(id => {
+      if (!newSelected.includes(id)) {
+        newSelected.push(id);
+      }
+    });
+    setSelectedRecordIds(newSelected);
+  }
+};
+const importSops = async (recordsToImport: SopRecord[], overwrite = false, saveNew = false) => {
     setLoading(true);
     try {
-      const res = await sopApi.SyncSopRecord({
-        record_ids: recordsToImport.map(r => r.id),
-        override: overwrite,
-        save_new: !overwrite
-      });
+        const res = await captureAndAlertRequestErrorHoc(
+            sopApi.SyncSopRecord({
+                record_ids: recordsToImport.map(r => r.id),
+                override: overwrite,
+                save_new: saveNew
+            })
+        );
 
+        // 处理重复情况
+        if (res?.repeat_name) {
+            setDuplicateNames(res.repeat_name);
+            setDuplicateDialogOpen(true);
+            return false;
+        }
 
-      // 处理重复情况
-      if (res.data?.repeat_name) {
-        setDuplicateNames(res.data.repeat_name);
-        setDuplicateDialogOpen(true);
-        return;
-      }
-
-      if (res.status_code !== 200) {
-        throw new Error(res.status_message || '导入失败');
-      }
-
-      toast({ variant: 'success', description: '导入成功' });
-      onOpenChange(false);
+        // 处理成功
+        toast({ variant: 'success', description: '导入成功' });
+        onOpenChange(false);
     } catch (error) {
-      toast({ variant: 'error', description: error.message });
+        toast({ 
+            variant: 'error', 
+            description: error.response?.data?.message || error.message || '导入失败'
+        });
     } finally {
-      setLoading(false);
+        setLoading(false);
     }
-  };
+};
 
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
@@ -226,26 +244,21 @@ const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
           <thead className="bg-gray-50 sticky top-0 z-10">
             <tr>
               <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                <button
-                  type="button"
-                  className={`h-4 w-4 rounded border flex items-center justify-center ${
-                    records.length > 0 && 
-                    records.every(r => selectedRecords.some(sr => sr.id === r.id)) 
-                      ? 'bg-blue-600 border-blue-600'
-                      : 'bg-white border-gray-300'
-                  }`}
-                  onClick={() => {
-                    if (records.every(r => selectedRecords.some(sr => sr.id === r.id))) {
-                      setSelectedRecords([]);
-                    } else {
-                      setSelectedRecords([...records]);
-                    }
-                  }}
-                >
-                  {records.every(r => selectedRecords.some(sr => sr.id === r.id)) && (
-                    <Check className="w-3 h-3 text-white" />
-                  )}
-                </button>
+                  <button
+          type="button"
+          className={`h-4 w-4 rounded border flex items-center justify-center ${
+            records.length > 0 && 
+            records.every(r => selectedRecordIds.includes(r.id)) 
+              ? 'bg-blue-600 border-blue-600'
+              : 'bg-white border-gray-300'
+          }`}
+          onClick={handleToggleSelectAll}
+        >
+          {records.length > 0 && 
+          records.every(r => selectedRecordIds.includes(r.id)) && (
+            <Check className="w-3 h-3 text-white" />
+          )}
+        </button>
               </th>
               <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                 名称
@@ -278,27 +291,27 @@ const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
             </tr>
           </thead>
           <tbody className="bg-white divide-y divide-gray-200">
-            {sortedRecords.map((record) => (
-              <tr 
-                key={record.id}
-                className={`cursor-pointer ${currentRecord?.id === record.id ? 'bg-blue-50' : ''}`}
-                onClick={() => handleSelectRecord(record)}
-              >
-                <td className="px-6 py-4 whitespace-nowrap">
-                  <button
-                    type="button"
-                    className={`h-4 w-4 rounded border flex items-center justify-center ${
-                      selectedRecords.some(r => r.id === record.id)
-                        ? 'bg-blue-600 border-blue-600'
-                        : 'bg-white border-gray-300'
-                    }`}
-                    onClick={(e) => handleToggleSelect(record, e)}
-                  >
-                    {selectedRecords.some(r => r.id === record.id) && (
-                      <Check className="w-3 h-3 text-white" />
-                    )}
-                  </button>
-                </td>
+            { sortedRecords.map((record) => (
+    <tr 
+      key={record.id}
+      className={`cursor-pointer ${currentRecord?.id === record.id ? 'bg-blue-50' : ''}`}
+      onClick={() => handleSelectRecord(record)}
+    >
+      <td className="px-6 py-4 whitespace-nowrap">
+        <button
+          type="button"
+          className={`h-4 w-4 rounded border flex items-center justify-center ${
+            selectedRecordIds.includes(record.id)
+              ? 'bg-blue-600 border-blue-600'
+              : 'bg-white border-gray-300'
+          }`}
+          onClick={(e) => handleToggleSelect(record, e)}
+        >
+          {selectedRecordIds.includes(record.id) && (
+            <Check className="w-3 h-3 text-white" />
+          )}
+        </button>
+      </td>
                 <td className="px-6 py-4 whitespace-nowrap max-w-[200px]">
                   <div className="text-sm font-medium text-gray-900 truncate">
                     {record.name}
@@ -364,13 +377,13 @@ const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
 
             <div className="flex items-center justify-start mt-4"> 
               <span>已选择 {selectedRecords.length}项</span>
-              <Button 
-                onClick={() => importSops(selectedRecords)}
-                disabled={selectedRecords.length === 0 || loading}
-                className="ml-4"
-              >
-                {loading ? '导入中...' : '批量导入'}
-              </Button>
+        <Button 
+            onClick={() => importSops(selectedRecords, false, false)}
+            disabled={selectedRecords.length === 0 || loading}
+            className="ml-4"
+        >
+            {loading ? '导入中...' : '批量导入'}
+        </Button>
             </div>
           </div>
 
@@ -387,14 +400,24 @@ const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
                     {currentRecord.content}
                   </pre>
                 </div>
-                <div className="flex justify-start gap-2 pt-4">
-                  <Button 
-                    onClick={() => importSops([currentRecord])}
-                    disabled={selectedRecords.length > 1 || loading}
-                  >
-                    {loading ? '导入中...' : '导入当前SOP'}
-                  </Button>
-                </div>
+           <div className="flex justify-start gap-2 pt-4">
+  <Button 
+    onClick={() => {
+      if (!currentRecord) return;
+      
+      // 直接尝试导入当前SOP
+      importSops([currentRecord]).then((hasDuplicate) => {
+        if (hasDuplicate === false) {
+          // 如果有重复，打开重复对话框
+          setDuplicateDialogOpen(true);
+        }
+      });
+    }}
+    disabled={!currentRecord || loading}
+  >
+    {loading ? '导入中...' : '导入当前SOP'}
+  </Button>
+</div>
               </>
             ) : (
               <div className="flex justify-center items-center h-full text-muted-foreground">
@@ -404,48 +427,52 @@ const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
           </div>
         </div>
       </SheetContent>
-     <Dialog open={duplicateDialogOpen} onOpenChange={setDuplicateDialogOpen}>
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>SOP重复提示</DialogTitle>
-          <DialogDescription>
-            以下SOP在库中已存在，确认是否在导入时覆盖？
-          </DialogDescription>
-        </DialogHeader>
-        <div className="max-h-[300px] overflow-y-auto border rounded-md p-4">
-          {duplicateNames.length > 0 ? (
-            duplicateNames.map((name, index) => (
-              <div key={index} className="py-2 border-b last:border-b-0">
-                {name}
-              </div>
-            ))
-          ) : (
-            <div className="text-center py-2 text-muted-foreground">
-              未获取到重复SOP名称
-            </div>
-          )}
+  <Dialog open={duplicateDialogOpen} onOpenChange={setDuplicateDialogOpen}>
+  <DialogContent>
+    <DialogHeader>
+      <DialogTitle>SOP重复提示</DialogTitle>
+      <DialogDescription>
+        以下SOP在库中已存在，确认是否在导入时覆盖？
+      </DialogDescription>
+    </DialogHeader>
+    <div className="max-h-[300px] overflow-y-auto border rounded-md p-4">
+      {duplicateNames.length > 0 ? (
+        duplicateNames.map((name, index) => (
+          <div key={index} className="py-2 border-b last:border-b-0">
+            {name}
+          </div>
+        ))
+      ) : (
+        <div className="text-center py-2 text-muted-foreground">
+          未获取到重复SOP名称
         </div>
-        <div className="flex justify-end gap-2 pt-4">
-          <Button 
-            variant="outline" 
-            onClick={() => {
-              importSops(selectedRecords, false);
-              setDuplicateDialogOpen(false);
-            }}
-          >
-            不覆盖，另存为新SOP
-          </Button>
-          <Button 
-            onClick={() => {
-              importSops(selectedRecords, true);
-              setDuplicateDialogOpen(false);
-            }}
-          >
-            覆盖
-          </Button>
-        </div>
-      </DialogContent>
-    </Dialog>
+      )}
+    </div>
+    <div className="flex justify-end gap-2 pt-4">
+      <Button 
+        variant="outline" 
+        onClick={() => {
+          // 如果是当前SOP导入，确保传递当前SOP
+          const recordsToUse = selectedRecords.length > 0 ? selectedRecords : currentRecord ? [currentRecord] : [];
+          importSops(recordsToUse, false, true);
+          setDuplicateDialogOpen(false);
+        }}
+      >
+        不覆盖，另存为新SOP
+      </Button>
+      <Button 
+        onClick={() => {
+          // 如果是当前SOP导入，确保传递当前SOP
+          const recordsToUse = selectedRecords.length > 0 ? selectedRecords : currentRecord ? [currentRecord] : [];
+          importSops(recordsToUse, true, false);
+          setDuplicateDialogOpen(false);
+        }}
+      >
+        覆盖
+      </Button>
+    </div>
+  </DialogContent>
+</Dialog>
     </Sheet>
   );
 }
