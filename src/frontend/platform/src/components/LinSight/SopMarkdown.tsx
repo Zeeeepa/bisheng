@@ -5,9 +5,97 @@ import Vditor from "vditor";
 import "vditor/dist/index.css";
 import SopToolsDown from "./SopToolsDown";
 
+
+// 错误工具toolip提示
+const ToolErrorTip = () => {
+    const [tooltipState, setTooltipState] = useState({
+        show: false,
+        message: '错误变量',
+        position: { left: 0, top: 0 }
+    });
+    const currentElementRef = useRef<HTMLElement | null>(null);
+    const tooltipRef = useRef<HTMLDivElement>(null);
+
+    // 处理鼠标移入事件
+    const handleMouseOver = (e: MouseEvent) => {
+        const target = (e.target as HTMLElement).closest?.('.linsi-error');
+        if (!(target instanceof HTMLElement)) return;
+
+        currentElementRef.current = target;
+        const rect = target.getBoundingClientRect();
+        setTooltipState({
+            show: true,
+            message: '⚠️ 工具或资源不存在，请重新选择',
+            position: {
+                left: rect.left + rect.width / 2,
+                top: rect.top - 4
+            }
+        });
+    };
+
+    // 处理鼠标移出事件
+    const handleMouseOut = (e: MouseEvent) => {
+        const relatedTarget = e.relatedTarget as HTMLElement;
+        if (
+            !relatedTarget ||
+            !currentElementRef.current?.contains(relatedTarget) &&
+            !tooltipRef.current?.contains(relatedTarget)
+        ) {
+            setTooltipState(prev => ({ ...prev, show: false }));
+        }
+    };
+
+    // 处理滚动事件
+    const handleScroll = () => {
+        if (currentElementRef.current && tooltipState.show) {
+            const rect = currentElementRef.current.getBoundingClientRect();
+            setTooltipState(prev => ({
+                ...prev,
+                position: {
+                    left: rect.left + rect.width / 2,
+                    top: rect.top - 4
+                }
+            }));
+        }
+    };
+
+    useEffect(() => {
+        const container = document.getElementById('sop-vditor');
+        if (!container) return
+
+        container.addEventListener('mouseover', handleMouseOver as EventListener);
+        container.addEventListener('mouseout', handleMouseOut as EventListener);
+        window.addEventListener('scroll', handleScroll, true);
+
+        return () => {
+            container.removeEventListener('mouseover', handleMouseOver as EventListener);
+            container.removeEventListener('mouseout', handleMouseOut as EventListener);
+            window.removeEventListener('scroll', handleScroll, true);
+        };
+    }, []);
+
+    return (
+        <div
+            ref={tooltipRef}
+            className={`pointer-events-none fixed transition-opacity ${tooltipState.show ? 'opacity-100' : 'opacity-0'
+                }`}
+            style={{
+                left: tooltipState.position.left,
+                top: tooltipState.position.top,
+                transform: 'translateX(-50%) translateY(-100%)'
+            }}
+        >
+            <div className="bg-red-100 text-red-500 text-xs px-2 py-1 rounded shadow-lg">
+                {tooltipState.message}
+                <div className="absolute bottom-0 left-1/2 transform -translate-x-1/2 translate-y-full w-0 h-0 border-l-4 border-r-4 border-t-4 border-l-transparent border-r-transparent border-t-red-100" />
+            </div>
+        </div>
+    );
+};
 interface MarkdownProps {
     defaultValue: string,
     onChange?: any;
+    disabled?: boolean;
 }
 
 interface MarkdownRef {
@@ -15,17 +103,18 @@ interface MarkdownRef {
 }
 
 const SopMarkdown = forwardRef<MarkdownRef, MarkdownProps>((props, ref) => {
-    const { tools, defaultValue, onChange } = props;
+    const { value, tools, height = 'h-[calc(100vh-420px)]', defaultValue, disabled = false, onChange } = props;
 
     const veditorRef = useRef<any>(null);
     const inserRef = useRef<any>(null);
     const boxRef = useRef<any>(null);
     const scrollBoxRef = useRef<any>(null);
 
+    useAutoHeight(boxRef);
+
     const { nameToValueRef, valueToNameRef, buildTreeData: toolOptions } = useSopTools(tools)
     const [RenderingCompleted, setRenderingCompleted] = useState(false);
-useAutoHeight(boxRef);
-    
+
     useEffect(() => {
         const vditorDom = document.getElementById('sop-vditor');
         if (!vditorDom) return
@@ -44,6 +133,13 @@ useAutoHeight(boxRef);
                 setRenderingCompleted(true);
                 veditorRef.current = vditor;
                 scrollBoxRef.current = vditorDom.querySelector('.vditor-reset');
+                // 拦截粘贴
+                const editorElement = vditor.vditor[vditor.vditor.currentMode].element
+                getMarkdownPaste(editorElement, (text) => {
+                    const value = replaceBracesToMarkers(text, nameToValueRef.current)
+                    const name = replaceMarkersToBraces(value, valueToNameRef.current, nameToValueRef.current)
+                    vditor.insertValue(name);
+                })
             },
             input: (val) => onChange(replaceBracesToMarkers(val, nameToValueRef.current)),
             hint: {
@@ -77,6 +173,8 @@ useAutoHeight(boxRef);
                 }
             },
             tab: "\t",
+            offPaste: true,
+            disabled: disabled
         });
 
         return () => {
@@ -91,7 +189,6 @@ useAutoHeight(boxRef);
             // 回显值
             veditorRef.current?.setValue(replaceMarkersToBraces(defaultValue, valueToNameRef.current, nameToValueRef.current))
         }
-
     }, [RenderingCompleted])
 
     // 暴露方法给父组件
@@ -99,6 +196,9 @@ useAutoHeight(boxRef);
         getValue: () => {
             return replaceBracesToMarkers(veditorRef.current?.getValue(), nameToValueRef.current)
         },
+        setValue: (val) => {
+            veditorRef.current && veditorRef.current?.setValue(replaceMarkersToBraces(val, valueToNameRef.current, nameToValueRef.current))
+        }
     }));
 
     const [menuOpen, setMenuOpen] = useState(false);
@@ -111,7 +211,7 @@ useAutoHeight(boxRef);
 
     useAtTip(scrollBoxRef)
 
-    return <div ref={boxRef} className="relative border rounded-md  h-[calc(100vh-420px)] bg-[#fff]">
+    return <div ref={boxRef} className={"relative border rounded-md bg-[#fff] " + height}>
         <div id="sop-vditor" className="linsight-vditor rounded-md border-none" />
         {/* 工具选择 */}
         <SopToolsDown
@@ -122,6 +222,7 @@ useAutoHeight(boxRef);
             onChange={handleChange}
             onClose={() => setMenuOpen(false)}
         />
+        <ToolErrorTip />
     </div >;
 });
 
@@ -326,6 +427,81 @@ const useAutoHeight = (boxRef) => {
     }, []);
 }
 
+// markdown粘贴逻辑
+const getMarkdownPaste = async (editorElement, callBack) => {
+    // 监听粘贴事件
+    editorElement.addEventListener('paste', async (event) => {
+        // 1. 阻止默认粘贴行为
+        event.preventDefault();
+
+        // 2. 获取剪贴板数据
+        const clipboardData = event.clipboardData || window.clipboardData;
+
+        // 3. 处理不同类型的数据
+        let processedContent = '';
+
+        // 情况1: 纯文本处理
+        if (clipboardData.types.includes('text/plain')) {
+            const text = clipboardData.getData('text/plain');
+            processedContent = await processText(text); // 自定义文本处理函数
+        }
+
+        // 情况2: HTML内容处理 (如从网页复制)
+        // else if (clipboardData.types.includes('text/html')) {
+        //     const html = clipboardData.getData('text/html');
+        //     processedContent = await processHTML(html); // 自定义HTML处理函数
+        // }
+
+        // 情况3: 图片处理
+        // else if ([...clipboardData.items].some(item => item.type.includes('image'))) {
+        //     processedContent = await processImage(clipboardData); // 自定义图片处理
+        // }
+
+        // 4. 插入处理后的内容
+        if (processedContent) {
+            // 使用 Vditor API 插入内容
+
+            callBack(processedContent);
+            // 或者直接操作 DOM (适用于复杂插入)
+            // document.execCommand('insertHTML', false, processedContent);
+        }
+    });
+
+    // 示例处理函数
+    async function processText(text) {
+        // 在这里实现你的文本处理逻辑
+        return text;
+    }
+
+    async function processHTML(html) {
+        // 示例：移除所有HTML标签只保留纯文本
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        return doc.body.textContent || "";
+    }
+
+    async function processImage(clipboardData) {
+        // 获取图片文件
+        const imageItem = [...clipboardData.items].find(item =>
+            item.type.includes('image')
+        );
+
+        if (!imageItem) return '';
+
+        const blob = imageItem.getAsFile();
+        const base64 = await convertBlobToBase64(blob);
+
+        // 返回 Markdown 图片格式
+        return `![粘贴图片](${base64})`;
+    }
+
+    function convertBlobToBase64(blob) {
+        return new Promise((resolve) => {
+            const reader = new FileReader();
+            reader.onloadend = () => resolve(reader.result);
+            reader.readAsDataURL(blob);
+        });
+    }
+}
 /**
  * 正向替换：将 @标记@ 替换为 {{value}} 格式
  * @param {string} inputStr - 输入字符串
@@ -333,7 +509,7 @@ const useAutoHeight = (boxRef) => {
  * @returns {string} - 替换后的字符串
  */
 function replaceMarkersToBraces(inputStr, valueToNameMap, nameToValueMap) {
-    const regex = /@([^@]+)@/g;
+    const regex = /@([^@\r\n]+)@/g;
     return inputStr.replace(regex, (match, id) => {
         // 检查映射中是否存在该ID
         if (Object.prototype.hasOwnProperty.call(valueToNameMap, id)) {
@@ -344,7 +520,7 @@ function replaceMarkersToBraces(inputStr, valueToNameMap, nameToValueMap) {
             return `{{@${id}@}}`;
         }
         console.warn('转换ui时未找到对应的ID  :>> ', valueToNameMap, id);
-        return `@${id}@`; // 未找到时保留原始ID
+        return `{{#${id}#}}`; // 未找到时标记红色
     });
 }
 

@@ -6,6 +6,93 @@ import { LinsightInfo } from "~/store/linsight";
 import { SopStatus } from "./SOPEditor";
 import SopToolsDown from "./SopToolsDown";
 
+// 错误工具toolip提示
+const ToolErrorTip = () => {
+    const [tooltipState, setTooltipState] = useState({
+        show: false,
+        message: '错误变量',
+        position: { left: 0, top: 0 }
+    });
+    const currentElementRef = useRef<HTMLElement | null>(null);
+    const tooltipRef = useRef<HTMLDivElement>(null);
+
+    // 处理鼠标移入事件
+    const handleMouseOver = (e: MouseEvent) => {
+        const target = (e.target as HTMLElement).closest?.('.linsi-error');
+        if (!(target instanceof HTMLElement)) return;
+
+        currentElementRef.current = target;
+        const rect = target.getBoundingClientRect();
+        setTooltipState({
+            show: true,
+            message: '⚠️ 工具或资源不存在，请重新选择',
+            position: {
+                left: rect.left + rect.width / 2,
+                top: rect.top - 4
+            }
+        });
+    };
+
+    // 处理鼠标移出事件
+    const handleMouseOut = (e: MouseEvent) => {
+        const relatedTarget = e.relatedTarget as HTMLElement;
+        if (
+            !relatedTarget ||
+            !currentElementRef.current?.contains(relatedTarget) &&
+            !tooltipRef.current?.contains(relatedTarget)
+        ) {
+            setTooltipState(prev => ({ ...prev, show: false }));
+        }
+    };
+
+    // 处理滚动事件
+    const handleScroll = () => {
+        if (currentElementRef.current && tooltipState.show) {
+            const rect = currentElementRef.current.getBoundingClientRect();
+            setTooltipState(prev => ({
+                ...prev,
+                position: {
+                    left: rect.left + rect.width / 2,
+                    top: rect.top - 4
+                }
+            }));
+        }
+    };
+
+    useEffect(() => {
+        const container = document.getElementById('vditor');
+        if (!container) return
+
+        container.addEventListener('mouseover', handleMouseOver as EventListener);
+        container.addEventListener('mouseout', handleMouseOut as EventListener);
+        window.addEventListener('scroll', handleScroll, true);
+
+        return () => {
+            container.removeEventListener('mouseover', handleMouseOver as EventListener);
+            container.removeEventListener('mouseout', handleMouseOut as EventListener);
+            window.removeEventListener('scroll', handleScroll, true);
+        };
+    }, []);
+
+    return (
+        <div
+            ref={tooltipRef}
+            className={`pointer-events-none fixed transition-opacity ${tooltipState.show ? 'opacity-100' : 'opacity-0'
+                }`}
+            style={{
+                left: tooltipState.position.left,
+                top: tooltipState.position.top,
+                transform: 'translateX(-50%) translateY(-100%)'
+            }}
+        >
+            <div className="bg-red-100 text-red-500 text-xs px-2 py-1 rounded shadow-lg">
+                {tooltipState.message}
+                <div className="absolute bottom-0 left-1/2 transform -translate-x-1/2 translate-y-full w-0 h-0 border-l-4 border-r-4 border-t-4 border-l-transparent border-r-transparent border-t-red-100" />
+            </div>
+        </div>
+    );
+};
+
 interface MarkdownProps {
     linsight: LinsightInfo,
     edit?: boolean;
@@ -24,8 +111,6 @@ const SopMarkdown = forwardRef<MarkdownRef, MarkdownProps>((props, ref) => {
     const boxRef = useRef<any>(null);
     const scrollBoxRef = useRef<any>(null);
     useAutoHeight(boxRef)
-
-    const { Tooltip } = useToolErrorTip(boxRef);
 
     const { nameToValueRef, valueToNameRef, buildTreeData: toolOptions } = useSopTools(linsight)
     const [RenderingCompleted, setRenderingCompleted] = useState(false);
@@ -51,7 +136,9 @@ const SopMarkdown = forwardRef<MarkdownRef, MarkdownProps>((props, ref) => {
                 // 拦截粘贴
                 const editorElement = vditor.vditor[vditor.vditor.currentMode].element
                 getMarkdownPaste(editorElement, (text) => {
-                    vditor.insertValue(text);
+                    const value = replaceBracesToMarkers(text, nameToValueRef.current)
+                    const name = replaceMarkersToBraces(value, valueToNameRef.current, nameToValueRef.current)
+                    vditor.insertValue(name);
                 })
             },
             input: (val) => onChange(replaceBracesToMarkers(val, nameToValueRef.current)),
@@ -146,7 +233,7 @@ const SopMarkdown = forwardRef<MarkdownRef, MarkdownProps>((props, ref) => {
             onChange={handleChange}
             onClose={() => setMenuOpen(false)}
         />
-        <Tooltip />
+        <ToolErrorTip />
     </div >;
 });
 
@@ -167,46 +254,50 @@ const useSopTools = (linsight) => {
     const valueToNameRef = useRef({});
     // 整合数据为二级树结构
     const buildTreeData = useMemo(() => {
+        nameToValueRef.current = {};
+        valueToNameRef.current = {};
         const tree: { label: string; value: string; desc: string; children: any[] }[] = [];
 
         // 1. 转换files数据
-        const fileNode: any = {
-            label: "上传文件",
-            value: "",
-            desc: '',
-            children: []
-        };
-        const _name = "上传文件所在目录";
-        const _value = `上传文件所在目录:${bsConfig?.linsight_cache_dir}/${id?.substring(0, 8)}`;
-        nameToValueRef.current[_name] = _value;
-        valueToNameRef.current[_value] = _name;
-
-        fileNode.children = [{
-            label: _name,
-            value: _value,
-            desc: '',
-        }, ...files?.map(file => {
-            const name = file.file_name;
-            const value = `${file.file_name}的文件储存信息:{"文件储存在语义检索库中的id":"${file.file_id}","文件储存地址":"./${decodeURIComponent(file.markdown_filename)}"}`;
-            nameToValueRef.current[name] = value;
-            valueToNameRef.current[value] = name;
-            return {
-                label: file.file_name,
-                value: file.file_id,
+        if (files?.length > 0) {
+            const fileNode: any = {
+                label: "上传文件",
+                value: "",
                 desc: '',
                 children: []
-            }
-        }) || []];
-        tree.push(fileNode);
+            };
+            const _name = "上传文件所在目录";
+            const _value = `上传文件所在目录:${bsConfig?.linsight_cache_dir}/${id?.substring(0, 8)}`;
+            nameToValueRef.current[_name] = _value;
+            valueToNameRef.current[_value] = _name;
 
-        // 补充结果文件到 ref映射
-        if (file_list?.length) {
-            file_list.forEach(file => {
+            fileNode.children = [{
+                label: _name,
+                value: _value,
+                desc: '',
+            }, ...files?.map(file => {
                 const name = file.file_name;
                 const value = `${file.file_name}的文件储存信息:{"文件储存在语义检索库中的id":"${file.file_id}","文件储存地址":"./${decodeURIComponent(file.markdown_filename)}"}`;
                 nameToValueRef.current[name] = value;
                 valueToNameRef.current[value] = name;
-            });
+                return {
+                    label: file.file_name,
+                    value: file.file_id,
+                    desc: '',
+                    children: []
+                }
+            }) || []];
+            tree.push(fileNode);
+
+            // 补充结果文件到 ref映射
+            if (file_list?.length) {
+                file_list.forEach(file => {
+                    const name = file.file_name;
+                    const value = `${file.file_name}的文件储存信息:{"文件储存在语义检索库中的id":"${file.file_id}","文件储存地址":"./${decodeURIComponent(file.markdown_filename)}"}`;
+                    nameToValueRef.current[name] = value;
+                    valueToNameRef.current[value] = name;
+                });
+            }
         }
 
         // 2. 转换orgTools数据
@@ -296,25 +387,32 @@ const useSopTools = (linsight) => {
     return { nameToValueRef, valueToNameRef, buildTreeData };
 };
 
-// 滚动隐藏@标记
+// 滚动、resize隐藏@标记
 const useAtTip = (scrollBoxRef) => {
     useEffect(() => {
 
-        const handleScroll = () => {
+        const handleHideAtDom = () => {
             const atDom = document.querySelector('#vditor-placeholder-at');
             if (atDom) {
                 atDom.style.display = 'none';
             }
-        }
+        };
+        let resizeObserver;
         if (scrollBoxRef.current) {
-            scrollBoxRef.current.addEventListener('scroll', handleScroll);
+            scrollBoxRef.current.addEventListener('scroll', handleHideAtDom);
+            // Set up ResizeObserver for width changes
+            resizeObserver = new ResizeObserver(handleHideAtDom);
+            resizeObserver.observe(scrollBoxRef.current);
         }
 
         return () => {
             if (scrollBoxRef.current) {
-                scrollBoxRef.current.removeEventListener('scroll', handleScroll);
+                scrollBoxRef.current.removeEventListener('scroll', handleHideAtDom);
             }
-        }
+            if (resizeObserver) {
+                resizeObserver.disconnect();
+            }
+        };
     }, [scrollBoxRef.current])
 }
 
@@ -342,96 +440,6 @@ const useAutoHeight = (boxRef) => {
         };
     }, []);
 }
-
-// 错误工具toolip提示
-const useToolErrorTip = (boxRef: React.RefObject<HTMLElement>) => {
-    const [tooltipState, setTooltipState] = useState({
-        show: false,
-        message: '错误变量',
-        position: { left: 0, top: 0 }
-    });
-    const currentElementRef = useRef<HTMLElement | null>(null);
-    const tooltipRef = useRef<HTMLDivElement>(null);
-
-    // 处理鼠标移入事件
-    const handleMouseOver = (e: MouseEvent) => {
-        const target = (e.target as HTMLElement).closest?.('.linsi-error');
-        if (!(target instanceof HTMLElement)) return;
-
-        currentElementRef.current = target;
-        const rect = target.getBoundingClientRect();
-        setTooltipState({
-            show: true,
-            message: '⚠️ 工具或资源不存在，请重新选择',
-            position: {
-                left: rect.left + rect.width / 2,
-                top: rect.top - 4
-            }
-        });
-    };
-
-    // 处理鼠标移出事件
-    const handleMouseOut = (e: MouseEvent) => {
-        const relatedTarget = e.relatedTarget as HTMLElement;
-        if (
-            !relatedTarget ||
-            !currentElementRef.current?.contains(relatedTarget) &&
-            !tooltipRef.current?.contains(relatedTarget)
-        ) {
-            setTooltipState(prev => ({ ...prev, show: false }));
-        }
-    };
-
-    // 处理滚动事件
-    const handleScroll = () => {
-        if (currentElementRef.current && tooltipState.show) {
-            const rect = currentElementRef.current.getBoundingClientRect();
-            setTooltipState(prev => ({
-                ...prev,
-                position: {
-                    left: rect.left + rect.width / 2,
-                    top: rect.top - 4
-                }
-            }));
-        }
-    };
-
-    useEffect(() => {
-        const container = boxRef.current;
-        if (!container) return;
-
-        container.addEventListener('mouseover', handleMouseOver as EventListener);
-        container.addEventListener('mouseout', handleMouseOut as EventListener);
-        window.addEventListener('scroll', handleScroll, true);
-
-        return () => {
-            container.removeEventListener('mouseover', handleMouseOver as EventListener);
-            container.removeEventListener('mouseout', handleMouseOut as EventListener);
-            window.removeEventListener('scroll', handleScroll, true);
-        };
-    }, []);
-
-    // 返回 Tooltip 组件和状态
-    const Tooltip = () => (
-        <div
-            ref={tooltipRef}
-            className={`pointer-events-none fixed transition-opacity ${tooltipState.show ? 'opacity-100' : 'opacity-0'
-                }`}
-            style={{
-                left: tooltipState.position.left,
-                top: tooltipState.position.top,
-                transform: 'translateX(-50%) translateY(-100%)'
-            }}
-        >
-            <div className="bg-red-100 text-red-500 text-xs px-2 py-1 rounded shadow-lg">
-                {tooltipState.message}
-                <div className="absolute bottom-0 left-1/2 transform -translate-x-1/2 translate-y-full w-0 h-0 border-l-4 border-r-4 border-t-4 border-l-transparent border-r-transparent border-t-red-100" />
-            </div>
-        </div>
-    );
-
-    return { Tooltip, tooltipState };
-};
 
 // markdown粘贴逻辑
 const getMarkdownPaste = async (editorElement, callBack) => {
